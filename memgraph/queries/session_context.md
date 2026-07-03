@@ -1,6 +1,6 @@
 # session_context
 
-Pure-SQL boot context. Always the first memgraph action in a fresh session — either implicitly via agent startup integration or explicitly via `memgraph/memgraph session-context` (macOS/Linux) or `pwsh memgraph/memgraph.ps1 session-context` (Windows). No OpenAI call.
+Pure-SQL boot context. Always the first memgraph action in a fresh session — either implicitly via agent startup integration or explicitly via `memgraph/memgraph session-context` (macOS/Linux) or `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` (Windows). No OpenAI call.
 
 ## What it projects
 

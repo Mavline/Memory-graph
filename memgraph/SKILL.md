@@ -4,7 +4,7 @@ description: >-
   Portable repo-local memory graph for Claude, Codex, macOS/Linux, and Windows
   — create (bootstrap), read, and write .agent/memory.db (SQLite + sqlite-vec +
   FTS5) with hybrid semantic+keyword recall. Self-contained kit: engine +
-  bootstrap + cross-platform wrappers (bash + pwsh). Use whenever a repo has
+  bootstrap + cross-platform wrappers (bash + PowerShell). Use whenever a repo has
   .agent/memory.db, or to stand memory up in a new project. On session start
   load active policies/open runs/next allowed WF; recall before non-trivial
   work; write on architectural decisions, non-trivial bugs (gotchas), WF
@@ -35,11 +35,12 @@ at `<repo>/memgraph/` and invoke it from the target repo, a Claude hook, a Codex
 session, or a regular shell:
 
     <skill>/memgraph <command> [args]           # macOS / Linux
-    pwsh <skill>/memgraph.ps1 <command> [args]   # Windows
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File <skill>/memgraph.ps1 <command> [args]  # Windows built-in
+    pwsh -NoProfile -ExecutionPolicy Bypass -File <skill>/memgraph.ps1 <command> [args]             # Windows PowerShell 7+
 
 where `<skill>` is this folder (normally `memgraph/` at your project root). Both
 wrappers handle venv activation, target-repo detection, `MEMGRAPH_DB`,
-the sqlite-vec extension path, `.env` loading, and (pwsh) UTF-8. Direct
+the sqlite-vec extension path, `.env` loading, and PowerShell UTF-8. Direct
 invocation of `scripts/memgraph.py` bypasses this setup and can fail with
 `AttributeError: enable_load_extension` on systems where the default `python3`
 is pyenv-managed (built without `--enable-loadable-sqlite-extensions`).
@@ -87,7 +88,8 @@ chunks are not truncated. Use the repo-local wrapper for every operation:
 `memgraph/memgraph show <id>` for a specific object's full text,
 `memgraph/memgraph recall "<query>"` for hybrid FTS+vector search, and
 `memgraph/memgraph session-context` for current project state. On Windows, use
-`pwsh memgraph/memgraph.ps1 <command>`.
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 <command>`;
+`pwsh` is an optional PowerShell 7 replacement, not a requirement.
 
 Startup integration should run the same wrapper's `session-context`: Claude can
 do this with a repo-local `.claude/settings.json` SessionStart hook; Codex
@@ -113,7 +115,7 @@ and update the DB through the appropriate `memgraph` write helper
 `write-claim`, etc.). Do not silently merge and do not fall back on
 markdown as authoritative.
 
-1. **Session start.** Startup integration runs `memgraph/memgraph session-context` automatically on macOS/Linux or `pwsh memgraph/memgraph.ps1 session-context` on Windows. No embedding call. Pure SQL projection of: active policies, open runs, top open WF, latest orchestration events, `project_overview` and `current_state` generated views. If startup integration is not installed, run it manually once per new session.
+1. **Session start.** Startup integration runs `memgraph/memgraph session-context` automatically on macOS/Linux or `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` on Windows. No embedding call. Pure SQL projection of: active policies, open runs, top open WF, latest orchestration events, `project_overview` and `current_state` generated views. If startup integration is not installed, run it manually once per new session.
 2. **Before any non-trivial task.** Run `memgraph/memgraph recall "<query>"` to hybrid-search (FTS5 + vector RRF). Triggers: "implement X", "fix Y", "refactor Z", "investigate bug", "why does … behave …", "is there a policy about …". One OpenAI embedding call (~$0.000003). Skip only for pure typo fixes, formatting-only diffs, or questions that can be answered from the current packet alone.
 3. **On unclear code behavior.** Run `memgraph/memgraph recall "<symptom phrase>" --type claim,event,decision`. Surfaces prior `claim(gotcha|risk|observation)` and `event(bug|fix|incident)` entries.
 4. **Before opening a new WF.** Run `memgraph/memgraph next-wf` to get the next valid `sequence_no` and the expected `wf_id` string. Pure SQL.

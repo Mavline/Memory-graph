@@ -1,6 +1,6 @@
 # insert_decision (write path)
 
-Wraps atomic inserts into four tables: `objects`, `decisions`, `index_docs`, `memory_vec` (+ `embedding_meta`). Do not hand-roll — call `memgraph/memgraph write-decision` on macOS/Linux or `pwsh memgraph/memgraph.ps1 write-decision` on Windows.
+Wraps atomic inserts into four tables: `objects`, `decisions`, `index_docs`, `memory_vec` (+ `embedding_meta`). Do not hand-roll — call `memgraph/memgraph write-decision` on macOS/Linux or `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 write-decision` on Windows.
 
 ## Inputs
 

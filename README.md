@@ -18,7 +18,24 @@ workflow tasks, runs, policies, review gates, entities, and relations.
 
 ## Quick Start
 
-Place `memgraph/` at the root of the target project.
+The intended use is agent-led initialization. Give this repository to your
+Claude/Codex agent and ask it to install the memory kit into the target project.
+
+Suggested prompt:
+
+```txt
+Initialize repo-local memory in this project using
+https://github.com/Mavline/Memory-graph.
+
+Follow project-memory-structure-instruction.md. Copy the memgraph/ kit into the
+project root, set up AGENTS.md and CLAUDE.md, create .agent/memory.db, configure
+startup context for Claude and Codex, verify session-context and recall, and
+commit only the intended portable files. Keep .env, memgraph/venv/,
+memgraph/vendor/, archives, backups, and generated scratch files out of git.
+Make it work on macOS/Linux and Windows.
+```
+
+Manual reference: place `memgraph/` at the root of the target project.
 
 macOS/Linux:
 
@@ -51,8 +68,8 @@ $src = if (Test-Path "$base") { "$base" } elseif (Test-Path "$base.dll") { "$bas
 Copy-Item $src vendor\vec0.dll
 venv\Scripts\python.exe scripts\bootstrap.py --target ..
 cd ..
-pwsh memgraph/memgraph.ps1 session-context
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context
 ```
 
-For full setup, including Claude SessionStart and Codex `AGENTS.md` startup
-rules, read `memgraph/install/README.md`.
+For full setup details, including Claude SessionStart and Codex `AGENTS.md`
+startup rules, read `memgraph/install/README.md`.

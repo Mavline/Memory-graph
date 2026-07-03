@@ -1,4 +1,3 @@
-#requires -Version 7
 <#
   memgraph.ps1 - native Windows launcher.
 
@@ -6,19 +5,24 @@
   Resolves repo root + DB, points sqlite-vec at vendor/vec0.dll, loads
   OPENAI_API_KEY from <repo>\.env, forces UTF-8 I/O (the memory is Russian),
   then runs the engine with the bundled venv python if present, else system
-  python. Mirrors the bash `memgraph` wrapper used on macOS/Linux.
+  python. Compatible with Windows PowerShell 5.1 (`powershell.exe`) and
+  PowerShell 7+ (`pwsh`). Mirrors the bash `memgraph` wrapper used on
+  macOS/Linux.
 
-  Usage:   pwsh memgraph/memgraph.ps1 <command> [args...]
+  Usage:   powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 <command> [args...]
+           pwsh -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 <command> [args...]
   Backend: OpenAI text-embedding-3-small@512 + sqlite-vec (hybrid recall).
   Note:    `session-context` is pure SQL (no key / no vec0 needed), so startup
            integration works offline and on first boot.
 #>
 $ErrorActionPreference = 'Stop'
-$PSNativeCommandUseErrorActionPreference = $false
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+  $PSNativeCommandUseErrorActionPreference = $false
+}
 
 # UTF-8 everywhere so Cyrillic from the engine is not mangled in the console.
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 

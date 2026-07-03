@@ -36,6 +36,6 @@ Over a month of daily work: ~$0.002. Embedding calls are not a budget concern in
 
 ## Ceilings that DO matter
 
-- **Session-context doc is large.** The rendered `project_overview` + `current_state` bodies can be >5k tokens combined. Not an API cost — but it burns context window on session start. If startup output is too heavy, render a compact form via `memgraph/memgraph session-context --format json` (Windows: `pwsh memgraph/memgraph.ps1 session-context --format json`) and post-process.
+- **Session-context doc is large.** The rendered `project_overview` + `current_state` bodies can be >5k tokens combined. Not an API cost — but it burns context window on session start. If startup output is too heavy, render a compact form via `memgraph/memgraph session-context --format json` (Windows: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context --format json`) and post-process.
 - **Recall `--k` above 20.** Fusion is cheap but the result text will eat context. Default 10 is almost always right.
 - **Hot loops.** Do not embed the same query twice in a row. If you need to refine, use filters (`--type`, `--k`) on a single result set.

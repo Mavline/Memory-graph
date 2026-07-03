@@ -27,10 +27,11 @@ the canonical layout.
 
 ## 0. Prerequisites
 
-Python 3, Git, and on Windows also PowerShell 7 (`pwsh`). On Windows use the
-python.org build — it has loadable sqlite-extension support that the Microsoft
-Store / some pyenv builds lack. Internet to PyPI + OpenAI. Run the commands
-below from inside this `memgraph/` folder unless noted.
+Python 3 and Git. On Windows, built-in Windows PowerShell 5.1
+(`powershell.exe`) is enough; PowerShell 7 (`pwsh`) is optional. Use the
+python.org Python build — it has loadable sqlite-extension support that the
+Microsoft Store / some pyenv builds lack. Internet to PyPI + OpenAI. Run the
+commands below from inside this `memgraph/` folder unless noted.
 
 ## 1. venv + dependencies  (per machine, gitignored)
 
@@ -40,7 +41,7 @@ macOS / Linux:
     ./venv/bin/python -m pip install --upgrade pip
     ./venv/bin/python -m pip install -r requirements.txt
 
-Windows (pwsh):
+Windows PowerShell:
 
     python -m venv venv
     venv\Scripts\python.exe -m pip install --upgrade pip
@@ -58,7 +59,7 @@ macOS:
 
 Linux: same, but name the copy `vendor/vec0.so`.
 
-Windows (pwsh):
+Windows PowerShell:
 
     New-Item -ItemType Directory -Force vendor | Out-Null
     $base = & venv\Scripts\python.exe -c "import sqlite_vec; print(sqlite_vec.loadable_path())"
@@ -100,10 +101,10 @@ global machine config, or it will not move between machines. Use
 command at this wrapper:
 
 - macOS / Linux: `memgraph/memgraph session-context`
-- Windows (pwsh): `pwsh -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context`
-- Windows where Claude runs hooks under Git Bash (pwsh not on PATH), resolve it
-  inside the command:
-  `PWSH="$(command -v pwsh || echo "$LOCALAPPDATA/Microsoft/WindowsApps/pwsh.exe")"; "$PWSH" -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context`
+- Windows built-in PowerShell: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context`
+- Windows PowerShell 7 if installed: `pwsh -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context`
+- Windows where Claude runs hooks under Git Bash can call the built-in shell:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context`
 
 For Codex, put the shared rule in project-local `AGENTS.md` under Startup
 Discipline and run the same wrapper command at session start (or through any
@@ -120,9 +121,13 @@ macOS / Linux (run from the project root):
     memgraph/memgraph recall "<paraphrase of a known fact>"  # needs key; must report "vector_leg": true
     memgraph/memgraph write-claim --type observation --statement "kit live" --confidence 0.9
 
-Windows: same commands via `pwsh memgraph/memgraph.ps1 <cmd>`. Then open a fresh
-Claude or Codex session in the project and confirm session context is available.
-If not, run the startup command by hand and read the error (PATH, shell,
+Windows: same commands via:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 <cmd>
+
+`pwsh` is also fine if PowerShell 7 is installed. Then open a fresh Claude or
+Codex session in the project and confirm session context is available. If not,
+run the startup command by hand and read the error (PATH, shell,
 `.claude/settings.json`, or `AGENTS.md`/hook wiring).
 
 ## Ships vs rebuilt

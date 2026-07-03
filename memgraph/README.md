@@ -46,7 +46,7 @@ install/
 
 ## Quick entry points
 
-- On session start run `memgraph/memgraph session-context` (macOS/Linux) or `pwsh memgraph/memgraph.ps1 session-context` (Windows). Claude can automate this with `.claude/settings.json`; Codex should carry the same rule in `AGENTS.md` or an equivalent local hook.
+- On session start run `memgraph/memgraph session-context` (macOS/Linux) or `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` (Windows). Claude can automate this with `.claude/settings.json`; Codex should carry the same rule in `AGENTS.md` or an equivalent local hook.
 - Before any non-trivial task: `memgraph/memgraph recall "<query>"`.
 - To write durable knowledge: `memgraph/memgraph write-decision | write-claim | write-entity | write-relation`.
 - To run the orchestration loop: `memgraph/memgraph next-wf`, `memgraph/memgraph open-wf`, `memgraph/memgraph wf-status`, `memgraph/memgraph write-review`, `memgraph/memgraph open-run`, `memgraph/memgraph close-run`.

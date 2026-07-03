@@ -39,4 +39,4 @@ Opens a new WF: inserts `workflow_tasks` + a companion `orchestration_event(even
 
 - `sequence_no` and `wf_id` are `UNIQUE`; concurrent writers hit the UNIQUE constraint and retry via the driver's backoff.
 - `owned_files_json` and `forbidden_paths_json` must be valid JSON arrays (`json_valid` + `json_type = 'array'`).
-- `AGENTS.md` policy: do not open a new WF while the current tranche has unresolved findings. The helper does not enforce this — the orchestrator agent must check first (`memgraph/memgraph recall "findings" --type review_gate` and the open tranche state; on Windows use `pwsh memgraph/memgraph.ps1 recall ...`).
+- `AGENTS.md` policy: do not open a new WF while the current tranche has unresolved findings. The helper does not enforce this — the orchestrator agent must check first (`memgraph/memgraph recall "findings" --type review_gate` and the open tranche state; on Windows use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 recall ...`).

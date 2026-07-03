@@ -10,7 +10,8 @@ Before non-trivial work:
 
 1. Run `git status --short --branch`.
 2. If `.agent/memory.db` exists, run `memgraph/memgraph session-context` on
-   macOS/Linux or `pwsh memgraph/memgraph.ps1 session-context` on Windows.
+   macOS/Linux or `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+   memgraph/memgraph.ps1 session-context` on Windows.
 3. Read `project-memory-structure-instruction.md`, then the relevant files under
    `memgraph/`.
 
@@ -27,7 +28,8 @@ If `.agent/memory.db` does not exist, the memory skill is idle for this repo.
 ## Portability Rules
 
 - Use the wrapper only: `memgraph/memgraph` on macOS/Linux,
-  `pwsh memgraph/memgraph.ps1` on Windows.
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1`
+  on Windows. `pwsh` is optional when PowerShell 7 is installed.
 - Do not call `memgraph/scripts/*.py` directly except documented bootstrap via
   the venv python.
 - Keep Claude integration in `.claude/settings.json`; keep Codex startup rules

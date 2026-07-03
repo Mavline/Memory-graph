@@ -40,7 +40,7 @@ markdown/json файлов, никаких параллельных «памят
 
 1. **Подача.** На старте каждой сессии агент должен выполнять
    repo-local wrapper (`memgraph/memgraph session-context` на macOS/Linux или
-   `pwsh memgraph/memgraph.ps1 session-context` на Windows) и получать срез
+   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` на Windows) и получать срез
    памяти в контекст. Для Claude это делается репозиторным SessionStart-хуком в
    `.claude/settings.json`; для Codex — правилом в проектном `AGENTS.md` и тем
    же wrapper-command на старте сессии или через локальный hook, если он
@@ -303,7 +303,7 @@ Before non-trivial work:
 1. Run `git status --short --branch`.
 2. If `.agent/memory.db` exists, run the repo-local wrapper:
    `memgraph/memgraph session-context` on macOS/Linux or
-   `pwsh memgraph/memgraph.ps1 session-context` on Windows.
+   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` on Windows.
 3. Read the source documents that exist, in source-hierarchy order.
 4. Classify the lane, branch, worktree, open task/run records, dirty files,
    owned files, forbidden files, and the next safe action.
@@ -522,7 +522,7 @@ failure cases; требуемые тесты и проверки; evidence, ко
 4. Подключить startup-интеграцию, которая на старте сессии в репозитории с
    `.agent/memory.db` выполняет repo-local wrapper и вкладывает вывод в
    контекст: `memgraph/memgraph session-context` на macOS/Linux или
-   `pwsh memgraph/memgraph.ps1 session-context` на Windows. Claude подключается
+   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` на Windows. Claude подключается
    через `.claude/settings.json`, Codex — через проектный `AGENTS.md` или
    доступный локальный hook.
 
@@ -532,7 +532,7 @@ failure cases; требуемые тесты и проверки; evidence, ко
 Правила:
 
 - `memgraph/memgraph session-context` на macOS/Linux или
-  `pwsh memgraph/memgraph.ps1 session-context` на Windows в начале работы;
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` на Windows в начале работы;
 - точечный `memgraph/memgraph recall "<query>"` перед нетривиальной работой;
 - write-хелперы для decisions, claims, gotchas, workflow status, reviews,
   blockers и принятого завершения задачи;
@@ -654,7 +654,7 @@ evidence-файлы под `.agent/tasks/**`; папки сырого вывод
 8. Добавить `OPENAI_API_KEY` в локальный `.env`; задокументировать в
    `.env.example`.
 9. Выполнить `memgraph/memgraph session-context` на macOS/Linux или
-   `pwsh memgraph/memgraph.ps1 session-context` на Windows.
+   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` на Windows.
 10. Записать начальные policy/decision проекта через memgraph.
 11. Закоммитить bootstrap-файлы, включая `.agent/memory.db` и любые
     замороженные `.agent/tasks/<TASK_ID>/spec.md`, исключая `.env` и
@@ -663,7 +663,7 @@ evidence-файлы под `.agent/tasks/**`; папки сырого вывод
     убедиться, что `session-context` доступен. Если нет — чинить команду
     startup-интеграции, путь или политику оболочки, пока не сработает.
 13. Проверить вознаграждение: `memgraph/memgraph recall "<запрос-парафраз>"`
-    (или Windows `pwsh memgraph/memgraph.ps1 recall "<запрос-парафраз>"`) должен
+    (или Windows `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 recall "<запрос-парафраз>"`) должен
     вернуть релевантные записи по смыслу (с включённым векторным плечом), а не
     пустоту. Это доказательство, что память будут использовать, а не игнорировать.
 

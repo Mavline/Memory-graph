@@ -38,4 +38,4 @@ Effect:
 ## Policy coupling
 
 - Use `closed_accepted` only when the run's review gates are `pass` or `accepted` (or `findings` with `non-blocking` notes per `CLAUDE.md` wording).
-- After close, check for next red boundary in the tranche via `memgraph/memgraph recall "<tranche name>" --type workflow_task,orchestration_event` (Windows: `pwsh memgraph/memgraph.ps1 recall ...`). Per `Autonomous Continuous Execution` policy, proceed immediately unless a stop condition applies.
+- After close, check for next red boundary in the tranche via `memgraph/memgraph recall "<tranche name>" --type workflow_task,orchestration_event` (Windows: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 recall ...`). Per `Autonomous Continuous Execution` policy, proceed immediately unless a stop condition applies.
