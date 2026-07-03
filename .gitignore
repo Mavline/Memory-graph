@@ -1,0 +1,17 @@
+.DS_Store
+.env
+*.bak
+*.backup
+*.orig
+*.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Per-machine runtime assets for this source repository.
+memgraph/venv/
+memgraph/vendor/
+
+# This repository ships the memory kit; target projects decide whether to track
+# their own .agent/memory.db.
+.agent/
