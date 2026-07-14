@@ -11,6 +11,8 @@ Subcommands:
     policy <fragment>     List policies matching name fragment.
     entity <canonical>    Lookup entity by canonical_name or alias.
     timeline --run <id> | --wf <id>
+    ingest-docs            Chunk + incrementally sync committed markdown docs
+                           into sources/chunks/index_docs/memory_vec.
 
     write-decision        Insert a decision object.
     write-claim           Insert a claim (gotcha/fact/...).
@@ -35,15 +37,18 @@ Env:
 from __future__ import annotations
 
 import argparse
+import calendar
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 MODEL = "text-embedding-3-small"
 DIMENSIONS = 512
@@ -54,6 +59,14 @@ MAX_SQLITE_VEC_K = 4095
 PROJECT_OVERVIEW_VIEW_NAME = "project_overview"
 CURRENT_STATE_VIEW_NAME = "current_state"
 MAX_GENERATED_VIEW_EMBEDDING_CHARS = 4000
+
+# ingest-docs: markdown chunking + batch embedding limits.
+MAX_CHUNK_CHARS = 6000
+MAX_EMBED_CHARS = 7000
+MAX_EMBED_BATCH = 100
+INGEST_ATX_RE = re.compile(r'^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$')
+INGEST_FENCE_RE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+INGEST_DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
 
 # ---------------------------------------------------------------------------
 # Infrastructure
@@ -172,6 +185,57 @@ def call_embed(text: str) -> List[float]:
             code=1,
         )
     return vec
+
+
+def call_embed_batch(texts: List[str]) -> List[List[float]]:
+    """Call embed.py --batch in slices of <= MAX_EMBED_BATCH texts; concatenate in order.
+
+    Keeps any single OpenAI call bounded (embed.py itself caps at 2048 items)
+    while letting callers pass an arbitrarily long list for one file's worth
+    of new chunks.
+    """
+    if not texts:
+        return []
+    here = Path(__file__).resolve().parent
+    embed_script = here / "embed.py"
+    if not embed_script.exists():
+        die("embed.py not found next to memgraph.py", where="call_embed_batch", code=2)
+
+    results: List[List[float]] = []
+    for i in range(0, len(texts), MAX_EMBED_BATCH):
+        slice_texts = texts[i : i + MAX_EMBED_BATCH]
+        proc = subprocess.run(
+            [sys.executable, str(embed_script), "--batch"],
+            input=json.dumps(slice_texts, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            die(
+                f"embed.py --batch failed: {proc.stderr.strip() or proc.stdout.strip()}",
+                where="call_embed_batch",
+                code=1,
+            )
+        try:
+            vecs = json.loads(proc.stdout.strip())
+        except json.JSONDecodeError as e:
+            die(f"embed.py --batch did not return JSON: {e}", where="call_embed_batch", code=1)
+        if not isinstance(vecs, list) or len(vecs) != len(slice_texts):
+            got = len(vecs) if isinstance(vecs, list) else type(vecs).__name__
+            die(
+                f"embed.py --batch returned wrong shape (expected {len(slice_texts)} vectors, got {got})",
+                where="call_embed_batch",
+                code=1,
+            )
+        for v in vecs:
+            if not isinstance(v, list) or len(v) != DIMENSIONS:
+                die(
+                    f"embed.py --batch returned wrong vector shape (expected {DIMENSIONS} floats)",
+                    where="call_embed_batch",
+                    code=1,
+                )
+        results.extend(vecs)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -2900,6 +2964,633 @@ def cmd_write_relation(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ingest-docs: chunk committed markdown docs into sources/chunks + materialize
+#
+# Documents on disk stay the source of truth; chunks are a search projection
+# (no claims/decisions are auto-created). Incremental: unchanged files are
+# skipped by whole-file content_hash; changed files are diffed chunk-by-chunk
+# so unchanged sections keep their object_id (evidence links stay valid).
+
+
+@dataclass
+class ChunkDraft:
+    heading_path: str
+    body: str
+    content_hash: str
+
+
+def _ingest_parse_sections(text: str, file_stem: str) -> List[Tuple[str, str]]:
+    """Split markdown into (heading_path, body) sections by ATX headings.
+
+    Fenced code blocks (``` / ~~~) are opaque: heading-like lines inside a
+    fence are body text, never structural headings. Empty/whitespace-only
+    sections are dropped (the heading breadcrumb still updates for children).
+    Preamble before the first heading uses file_stem as its heading_path.
+    """
+    lines = text.split("\n")
+    stack: List[Tuple[int, str]] = []
+    sections: List[Tuple[str, str]] = []
+    body_buf: List[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    def current_path() -> str:
+        return " > ".join(t for _, t in stack) if stack else file_stem
+
+    def flush() -> None:
+        body = "\n".join(body_buf).strip("\n")
+        if body.strip():
+            sections.append((current_path(), body))
+        body_buf.clear()
+
+    for line in lines:
+        lead = len(line) - len(line.lstrip(" "))
+        fence_match = INGEST_FENCE_RE.match(line) if lead <= 3 else None
+
+        if in_fence:
+            body_buf.append(line)
+            if (
+                fence_match
+                and fence_match.group(1)[0] == fence_char
+                and len(fence_match.group(1)) >= fence_len
+            ):
+                in_fence = False
+            continue
+
+        if fence_match:
+            in_fence = True
+            fence_char = fence_match.group(1)[0]
+            fence_len = len(fence_match.group(1))
+            body_buf.append(line)
+            continue
+
+        heading_match = INGEST_ATX_RE.match(line) if lead <= 3 else None
+        if heading_match:
+            flush()
+            level = len(heading_match.group(1))
+            heading_text = (heading_match.group(2) or "").strip()
+            heading_text = re.sub(r"\s+#+\s*$", "", heading_text).strip()
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, heading_text))
+            continue
+
+        body_buf.append(line)
+
+    flush()
+    return sections
+
+
+def _ingest_split_section(body: str, max_chars: int) -> List[str]:
+    """Split an over-cap section body at blank-line boundaries; hard-split a
+    single over-cap paragraph at the cap."""
+    if len(body) <= max_chars:
+        return [body]
+    paragraphs = re.split(r"\n{2,}", body)
+    pieces: List[str] = []
+    current = ""
+    for para in paragraphs:
+        candidate = f"{current}\n\n{para}" if current else para
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            pieces.append(current)
+            current = ""
+        if len(para) <= max_chars:
+            current = para
+        else:
+            start = 0
+            while start < len(para):
+                pieces.append(para[start : start + max_chars])
+                start += max_chars
+    if current:
+        pieces.append(current)
+    return pieces or [body[:max_chars]]
+
+
+def _ingest_build_chunk_drafts(text: str, file_stem: str) -> List[ChunkDraft]:
+    drafts: List[ChunkDraft] = []
+    for heading_path, body in _ingest_parse_sections(text, file_stem):
+        pieces = _ingest_split_section(body, MAX_CHUNK_CHARS)
+        multi = len(pieces) > 1
+        for i, piece in enumerate(pieces):
+            hp = f"{heading_path} [part {i + 1}]" if multi else heading_path
+            drafts.append(
+                ChunkDraft(heading_path=hp, body=piece, content_hash=sha256_text(f"{hp}\n{piece}"))
+            )
+    return drafts
+
+
+def _ingest_detect_date(filename: str) -> Optional[int]:
+    m = INGEST_DATE_RE.search(filename)
+    if not m:
+        return None
+    try:
+        return calendar.timegm(time.strptime(m.group(0), "%Y-%m-%d"))
+    except ValueError:
+        return None
+
+
+def _ingest_classify_source(rel_posix: str) -> Tuple[str, str]:
+    """Map a selected relpath to (source_role, source_category) per the ingest-docs spec table."""
+    if rel_posix == "AGENTS.md":
+        return "runtime_prompt", "policies"
+    if rel_posix.startswith("docs/evidence/"):
+        return "evidence", "project_doc"
+    if rel_posix.startswith("docs/"):
+        return "strategic_doc", "project_doc"
+    if rel_posix.startswith(".agent/tasks/") and rel_posix.endswith("/spec.md"):
+        return "task_spec", "task_packet"
+    return "doc", "other"
+
+
+def _ingest_chunk_embedding_text(rel_posix: str, heading_path: str, body: str) -> str:
+    text = compose_embedding_text([("Doc", rel_posix), ("Section", heading_path), ("Text", body)])
+    return text[:MAX_EMBED_CHARS] if len(text) > MAX_EMBED_CHARS else text
+
+
+def _ingest_chunk_title(rel_posix: str, heading_path: str) -> str:
+    return f"{rel_posix} § {heading_path}"[:200]
+
+
+def _ingest_chunk_tags(rel_posix: str, source_category: str) -> str:
+    return f"doc-chunk,{source_category},{rel_posix.split('/', 1)[0]}"
+
+
+def _ingest_is_within_repo(path: Path, repo_root: Path) -> bool:
+    try:
+        path.relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
+
+def _ingest_expand_paths_arg(raw_paths: Sequence[str], repo_root: Path) -> List[Path]:
+    """Resolve explicit --paths entries. Directories expand to **/*.md. Any
+    entry that resolves outside the repo is a hard die (guard #2)."""
+    resolved: List[Path] = []
+    for raw in raw_paths:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p = p.resolve()
+        if not _ingest_is_within_repo(p, repo_root):
+            die(
+                f"--paths entry '{raw}' resolves outside the repo ({repo_root}); "
+                "ingest-docs only ingests repo-local files",
+                where="ingest-docs",
+                code=2,
+            )
+        if not p.exists():
+            die(f"--paths entry '{raw}' does not exist (resolved to {p})", where="ingest-docs", code=2)
+        if p.is_dir():
+            resolved.extend(sorted(p.rglob("*.md")))
+        else:
+            resolved.append(p)
+    return resolved
+
+
+def _ingest_default_selection(repo_root: Path) -> List[Path]:
+    candidates: List[Path] = []
+    docs_dir = repo_root / "docs"
+    if docs_dir.is_dir():
+        candidates.extend(docs_dir.rglob("*.md"))
+    agents_md = repo_root / "AGENTS.md"
+    if agents_md.is_file():
+        candidates.append(agents_md)
+    tasks_dir = repo_root / ".agent" / "tasks"
+    if tasks_dir.is_dir():
+        candidates.extend(tasks_dir.rglob("spec.md"))
+    return candidates
+
+
+def _ingest_apply_excludes_sort_dedupe(paths: Iterable[Path], repo_root: Path) -> List[Path]:
+    """Always exclude CLAUDE.md, anything under memgraph/, and any non-.md file.
+    Applies uniformly to default selection and to --paths expansion."""
+    seen: Dict[str, Path] = {}
+    for p in paths:
+        rp = p.resolve()
+        if rp.suffix != ".md" or rp.name == "CLAUDE.md":
+            continue
+        try:
+            rel = rp.relative_to(repo_root)
+        except ValueError:
+            continue
+        if "memgraph" in rel.parts:
+            continue
+        seen[rel.as_posix()] = rp
+    return [seen[k] for k in sorted(seen)]
+
+
+def _ingest_is_chunk_referenced(conn: sqlite3.Connection, object_id: int) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 WHERE EXISTS (
+            SELECT 1 FROM relations
+            WHERE source_object_id = ? OR target_object_id = ? OR evidence_chunk_id = ?
+        ) OR EXISTS (SELECT 1 FROM claims WHERE primary_evidence_chunk_id = ?)
+          OR EXISTS (SELECT 1 FROM decisions WHERE primary_evidence_chunk_id = ?)
+          OR EXISTS (SELECT 1 FROM tasks WHERE primary_evidence_chunk_id = ?)
+          OR EXISTS (SELECT 1 FROM events WHERE primary_evidence_chunk_id = ?)
+        """,
+        (object_id,) * 7,
+    ).fetchone()
+    return row is not None
+
+
+def _ingest_delete_or_deindex_chunk(conn: sqlite3.Connection, chunk_row_id: int, object_id: int) -> str:
+    """Reference-safe deletion of one chunk object. Returns 'deleted' or 'deindexed_kept'.
+
+    Unreferenced: DELETE FROM objects cascades chunks + index_docs (FTS
+    trigger fires) + embedding_meta; memory_vec is not FK-covered so it is
+    deleted explicitly.
+    Referenced: keep objects + chunks (flipped to extraction_status=
+    'ignored'); drop index_docs/memory_vec/embedding_meta so stale text
+    leaves the search index while evidence links stay valid.
+    """
+    if _ingest_is_chunk_referenced(conn, object_id):
+        conn.execute("UPDATE chunks SET extraction_status='ignored' WHERE id=?", (chunk_row_id,))
+        conn.execute("DELETE FROM index_docs WHERE object_id=?", (object_id,))
+        conn.execute("DELETE FROM memory_vec WHERE rowid=?", (object_id,))
+        conn.execute("DELETE FROM embedding_meta WHERE object_id=?", (object_id,))
+        return "deindexed_kept"
+    # Delete index_docs explicitly, not via the objects FK cascade: the FTS
+    # sync trigger must fire on every SQLite build, and trigger-on-cascade
+    # behavior is not guaranteed across platforms this kit targets.
+    conn.execute("DELETE FROM index_docs WHERE object_id=?", (object_id,))
+    conn.execute("DELETE FROM memory_vec WHERE rowid=?", (object_id,))
+    conn.execute("DELETE FROM objects WHERE id=?", (object_id,))
+    return "deleted"
+
+
+def _ingest_diff_chunk_rows(
+    old_rows: Sequence[Tuple[int, int, str, str]],
+    new_drafts: Sequence[ChunkDraft],
+) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, ChunkDraft]], List[Tuple[int, int]]]:
+    """Match new chunk drafts to old chunk rows by content_hash.
+
+    Only old rows with extraction_status == 'parsed_structural' are eligible
+    for reuse (an 'ignored' row stays retired even on a coincidental hash
+    match, since it is pinned as evidence); each old row is consumed at most
+    once. Returns:
+      reused:    [(new_order_index, old_chunk_row_id, object_id), ...]
+      to_insert: [(new_order_index, draft), ...]
+      unmatched: [(old_chunk_row_id, object_id), ...]  (delete-with-reference-safety candidates)
+    """
+    available: Dict[str, List[Tuple[int, int]]] = {}
+    for row_id, obj_id, c_hash, status in old_rows:
+        if status == "parsed_structural":
+            available.setdefault(c_hash, []).append((row_id, obj_id))
+
+    reused: List[Tuple[int, int, int]] = []
+    to_insert: List[Tuple[int, ChunkDraft]] = []
+    consumed_row_ids: Set[int] = set()
+
+    for idx, draft in enumerate(new_drafts):
+        bucket = available.get(draft.content_hash)
+        if bucket:
+            row_id, obj_id = bucket.pop(0)
+            consumed_row_ids.add(row_id)
+            reused.append((idx, row_id, obj_id))
+        else:
+            to_insert.append((idx, draft))
+
+    unmatched = [
+        (row_id, obj_id)
+        for row_id, obj_id, _c_hash, _status in old_rows
+        if row_id not in consumed_row_ids
+    ]
+    return reused, to_insert, unmatched
+
+
+def _ingest_insert_chunk(
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    rel_posix: str,
+    source_category: str,
+    draft: ChunkDraft,
+    chunk_order: int,
+    detected_date: Optional[int],
+    vec: List[float],
+    ts: int,
+) -> int:
+    obj_id = insert_object(conn, "chunk", ts)
+    conn.execute(
+        """
+        INSERT INTO chunks(
+            object_id, source_id, heading_path, body, chunk_order,
+            detected_date, extraction_status, content_hash, imported_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            obj_id,
+            source_id,
+            draft.heading_path,
+            draft.body,
+            chunk_order,
+            detected_date,
+            "parsed_structural",
+            draft.content_hash,
+            ts,
+        ),
+    )
+    materialize(
+        conn,
+        obj_id,
+        "chunk",
+        title=_ingest_chunk_title(rel_posix, draft.heading_path),
+        summary=draft.body[:300],
+        body=draft.body,
+        tags=_ingest_chunk_tags(rel_posix, source_category),
+        aliases=rel_posix,
+        embedding_text=_ingest_chunk_embedding_text(rel_posix, draft.heading_path, draft.body),
+        ts=ts,
+        precomputed_vec=vec,
+    )
+    return obj_id
+
+
+def _ingest_run_prune(conn: sqlite3.Connection, repo_root: Path, *, dry_run: bool) -> Dict[str, Any]:
+    """Own transaction: sources rows whose file is missing from disk get all
+    their chunks reference-safe-deleted; the sources row itself is removed
+    only if it ends up with zero chunks rows left."""
+    rows = conn.execute("SELECT id, path FROM sources").fetchall()
+    missing = [(int(sid), path) for sid, path in rows if not (repo_root / path).exists()]
+
+    if not missing:
+        return {"files_pruned": 0, "chunks_deleted": 0, "chunks_deindexed_kept": 0, "plan_pruned": []}
+
+    files_pruned = 0
+    chunks_deleted = 0
+    chunks_deindexed_kept = 0
+    plan_pruned: List[Dict[str, Any]] = []
+
+    if not dry_run:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        for source_id, path in missing:
+            chunk_rows = conn.execute(
+                "SELECT id, object_id FROM chunks WHERE source_id=?", (source_id,)
+            ).fetchall()
+            n_deleted = 0
+            n_kept = 0
+            for row_id, obj_id in chunk_rows:
+                referenced = _ingest_is_chunk_referenced(conn, obj_id)
+                if referenced:
+                    n_kept += 1
+                else:
+                    n_deleted += 1
+                if not dry_run:
+                    _ingest_delete_or_deindex_chunk(conn, row_id, obj_id)
+
+            if not dry_run:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE source_id=?", (source_id,)
+                ).fetchone()[0]
+                source_removed = False
+                if remaining == 0:
+                    conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
+                    source_removed = True
+            else:
+                source_removed = n_kept == 0
+
+            files_pruned += 1
+            chunks_deleted += n_deleted
+            chunks_deindexed_kept += n_kept
+            plan_pruned.append(
+                {
+                    "path": path,
+                    "chunks_deleted": n_deleted,
+                    "chunks_deindexed_kept": n_kept,
+                    "source_removed": source_removed,
+                }
+            )
+        if not dry_run:
+            conn.execute("COMMIT")
+    except Exception:
+        if not dry_run:
+            conn.execute("ROLLBACK")
+        raise
+
+    return {
+        "files_pruned": files_pruned,
+        "chunks_deleted": chunks_deleted,
+        "chunks_deindexed_kept": chunks_deindexed_kept,
+        "plan_pruned": plan_pruned,
+    }
+
+
+def cmd_ingest_docs(args: argparse.Namespace) -> None:
+    repo_root = git_root().resolve()
+    expected_db = (repo_root / ".agent" / "memory.db").resolve()
+    actual_db = resolve_db_path().resolve()
+    if actual_db != expected_db:
+        die(
+            f"ingest-docs requires the repo-local DB {expected_db}; MEMGRAPH_DB points elsewhere "
+            f"(resolved to {actual_db})",
+            where="ingest-docs",
+            code=2,
+        )
+
+    if args.paths:
+        raw_candidates = _ingest_expand_paths_arg(args.paths, repo_root)
+    else:
+        raw_candidates = _ingest_default_selection(repo_root)
+    selected = _ingest_apply_excludes_sort_dedupe(raw_candidates, repo_root)
+
+    dry_run = bool(args.dry_run)
+    do_prune = not args.no_prune
+
+    conn = connect(expected_db, need_vec=True)
+
+    counters: Dict[str, int] = {
+        "files_scanned": len(selected),
+        "files_new": 0,
+        "files_changed": 0,
+        "files_unchanged": 0,
+        "files_pruned": 0,
+        "chunks_added": 0,
+        "chunks_reused": 0,
+        "chunks_deleted": 0,
+        "chunks_deindexed_kept": 0,
+        "embedding_batches": 0,
+        "embedded_chunks": 0,
+    }
+    plan_new: List[Dict[str, Any]] = []
+    plan_changed: List[Dict[str, Any]] = []
+    plan_pruned: List[Dict[str, Any]] = []
+
+    for path in selected:
+        rel_posix = path.relative_to(repo_root).as_posix()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        file_hash = sha256_text(text)
+
+        existing = conn.execute(
+            "SELECT id, content_hash FROM sources WHERE path=?", (rel_posix,)
+        ).fetchone()
+
+        if existing and existing[1] == file_hash:
+            counters["files_unchanged"] += 1
+            log(f"unchanged: {rel_posix}")
+            continue
+
+        drafts = _ingest_build_chunk_drafts(text, path.stem)
+        detected_date = _ingest_detect_date(path.name)
+        source_role, source_category = _ingest_classify_source(rel_posix)
+
+        if not existing:
+            embedding_texts = [
+                _ingest_chunk_embedding_text(rel_posix, d.heading_path, d.body) for d in drafts
+            ]
+            if dry_run:
+                plan_new.append({"path": rel_posix, "chunks": len(drafts)})
+                counters["files_new"] += 1
+                counters["chunks_added"] += len(drafts)
+                log(f"[dry-run] new: {rel_posix} (+{len(drafts)} chunks)")
+                continue
+
+            n_batches = (len(embedding_texts) + MAX_EMBED_BATCH - 1) // MAX_EMBED_BATCH
+            vecs = call_embed_batch(embedding_texts)
+            ts = now_utc()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    """
+                    INSERT INTO sources(path, source_role, source_category, content_hash, imported_at)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (rel_posix, source_role, source_category, file_hash, ts),
+                )
+                source_id = int(cur.lastrowid)
+                for idx, (draft, vec) in enumerate(zip(drafts, vecs)):
+                    _ingest_insert_chunk(
+                        conn,
+                        source_id=source_id,
+                        rel_posix=rel_posix,
+                        source_category=source_category,
+                        draft=draft,
+                        chunk_order=idx,
+                        detected_date=detected_date,
+                        vec=vec,
+                        ts=ts,
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            counters["files_new"] += 1
+            counters["chunks_added"] += len(drafts)
+            counters["embedded_chunks"] += len(drafts)
+            counters["embedding_batches"] += n_batches
+            log(f"new: {rel_posix} (+{len(drafts)} chunks)")
+        else:
+            source_id = int(existing[0])
+            old_rows = conn.execute(
+                """
+                SELECT id, object_id, content_hash, extraction_status
+                FROM chunks WHERE source_id=? ORDER BY chunk_order
+                """,
+                (source_id,),
+            ).fetchall()
+            reused, to_insert, unmatched = _ingest_diff_chunk_rows(old_rows, drafts)
+
+            unmatched_classified = [
+                (row_id, obj_id, _ingest_is_chunk_referenced(conn, obj_id))
+                for row_id, obj_id in unmatched
+            ]
+            n_deleted = sum(1 for *_ids, referenced in unmatched_classified if not referenced)
+            n_kept = sum(1 for *_ids, referenced in unmatched_classified if referenced)
+
+            if dry_run:
+                plan_changed.append(
+                    {
+                        "path": rel_posix,
+                        "chunks_reused": len(reused),
+                        "chunks_added": len(to_insert),
+                        "chunks_deleted": n_deleted,
+                        "chunks_deindexed_kept": n_kept,
+                    }
+                )
+                counters["files_changed"] += 1
+                counters["chunks_reused"] += len(reused)
+                counters["chunks_added"] += len(to_insert)
+                counters["chunks_deleted"] += n_deleted
+                counters["chunks_deindexed_kept"] += n_kept
+                log(
+                    f"[dry-run] changed: {rel_posix} (+{len(to_insert)} -{n_deleted} "
+                    f"reused={len(reused)} kept_ignored={n_kept})"
+                )
+                continue
+
+            embedding_texts = [
+                _ingest_chunk_embedding_text(rel_posix, d.heading_path, d.body) for _idx, d in to_insert
+            ]
+            n_batches = (
+                (len(embedding_texts) + MAX_EMBED_BATCH - 1) // MAX_EMBED_BATCH if embedding_texts else 0
+            )
+            vecs = call_embed_batch(embedding_texts) if embedding_texts else []
+            ts = now_utc()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for idx, row_id, _obj_id in reused:
+                    conn.execute(
+                        "UPDATE chunks SET chunk_order=?, imported_at=? WHERE id=?",
+                        (idx, ts, row_id),
+                    )
+                for row_id, obj_id in unmatched:
+                    _ingest_delete_or_deindex_chunk(conn, row_id, obj_id)
+                for (idx, draft), vec in zip(to_insert, vecs):
+                    _ingest_insert_chunk(
+                        conn,
+                        source_id=source_id,
+                        rel_posix=rel_posix,
+                        source_category=source_category,
+                        draft=draft,
+                        chunk_order=idx,
+                        detected_date=detected_date,
+                        vec=vec,
+                        ts=ts,
+                    )
+                conn.execute(
+                    "UPDATE sources SET content_hash=?, imported_at=? WHERE id=?",
+                    (file_hash, ts, source_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            counters["files_changed"] += 1
+            counters["chunks_reused"] += len(reused)
+            counters["chunks_added"] += len(to_insert)
+            counters["chunks_deleted"] += n_deleted
+            counters["chunks_deindexed_kept"] += n_kept
+            counters["embedded_chunks"] += len(to_insert)
+            counters["embedding_batches"] += n_batches
+            log(
+                f"changed: {rel_posix} (+{len(to_insert)} -{n_deleted} "
+                f"reused={len(reused)} kept_ignored={n_kept})"
+            )
+
+    if do_prune:
+        pruned = _ingest_run_prune(conn, repo_root, dry_run=dry_run)
+        counters["files_pruned"] = pruned["files_pruned"]
+        counters["chunks_deleted"] += pruned["chunks_deleted"]
+        counters["chunks_deindexed_kept"] += pruned["chunks_deindexed_kept"]
+        plan_pruned = pruned["plan_pruned"]
+
+    result: Dict[str, Any] = {"ok": True, "db": str(expected_db), **counters, "dry_run": dry_run}
+    if dry_run:
+        result["plan_new"] = plan_new
+        result["plan_changed"] = plan_changed
+        result["plan_pruned"] = plan_pruned
+    json.dump(result, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 
 
@@ -3127,6 +3818,20 @@ def build_parser() -> argparse.ArgumentParser:
     wrel.add_argument("--evidence-chunk", type=int, default=None)
     wrel.add_argument("--confidence", type=float, default=1.0)
     wrel.set_defaults(func=cmd_write_relation)
+
+    idoc = sub.add_parser(
+        "ingest-docs",
+        help="Chunk + incrementally sync committed markdown docs into sources/chunks/index_docs/memory_vec",
+    )
+    idoc.add_argument(
+        "--paths",
+        nargs="+",
+        default=None,
+        help="Explicit files and/or directories to ingest (directories expand to **/*.md); replaces the default selection",
+    )
+    idoc.add_argument("--dry-run", action="store_true", help="Print the plan and exit without writing")
+    idoc.add_argument("--no-prune", action="store_true", help="Skip removing sources rows for files missing on disk")
+    idoc.set_defaults(func=cmd_ingest_docs)
 
     return ap
 

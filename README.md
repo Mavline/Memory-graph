@@ -4,8 +4,9 @@ Portable repo-local memory kit for Claude, Codex, macOS/Linux, and Windows.
 
 The kit stores durable project memory in `.agent/memory.db` (SQLite + FTS5 +
 sqlite-vec) and exposes it through the `memgraph/` wrapper. The wrapper supports
-startup context, hybrid recall, and typed write helpers for decisions, claims,
-workflow tasks, runs, policies, review gates, entities, and relations.
+startup context, hybrid recall, document ingestion (`ingest-docs`), and typed
+write helpers for decisions, claims, workflow tasks, runs, policies, review
+gates, entities, and relations.
 
 ## Contents
 

@@ -52,4 +52,4 @@ Every row in a structured table has a matching `objects` row whose `object_type`
 
 ## chunk
 
-`chunks`. Raw textual slices of source docs (CLAUDE.md, memory-bank/*, run INDEX files, task packets, etc.). Read-only for the skill; owned by the migration pipeline. Referenced by `primary_evidence_chunk_id` across claims, decisions, tasks, events.
+`chunks`. Raw textual slices of source docs. Two sanctioned producers: the one-off migration pipeline (legacy memory-bank prose) and the `ingest-docs` command (committed repo markdown, `extraction_status='parsed_structural'`; stale-but-referenced rows are retired as `'ignored'`). Never hand-inserted with SQL. Referenced by `primary_evidence_chunk_id` across claims, decisions, tasks, events.

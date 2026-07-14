@@ -64,7 +64,7 @@ key, or agent startup integration; see `install/README.md` for the full stand-up
 - Never insert into `objects`, `index_docs`, `memory_vec`, `embedding_meta` outside of the provided scripts. The four tables must stay in sync; the scripts do it transactionally.
 - Never call a different embedding model or different dimensionality. `meta.embedding_model` and `meta.embedding_dimensions` are the only allowed values.
 - Never write a row whose `embedding_text_hash` does not match `sha256(embedding_text)`. The verify phase checks this and will fail the next migration.
-- Never touch `migration_log`, `chunks`, `sources` — those are raw-layer artifacts owned by the migration pipeline.
+- Never touch `migration_log`, `chunks`, `sources` with hand-written SQL — those raw-layer tables are owned by the migration pipeline and the `ingest-docs` command.
 - Never use timestamps from the model's own "today". Get UTC epoch from shell (`date -u +%s`) or from the helper, which uses `time.time()`.
 - Never start a new WF when the current tranche has unresolved findings (policy `No Forward Progress With Open Tails`), and do not skip in the `workflow_tasks.sequence_no` space.
 - Commit `.agent/memory.db` only when the target project's `AGENTS.md`/`.gitignore` explicitly tracks it as portable project memory. Never commit generated `.agent/` clutter, `.env`, `memgraph/venv/`, or `memgraph/vendor/`.
@@ -155,6 +155,36 @@ Every write goes through `memgraph` which handles the transactional insert into 
 9. **Relation.** After any write above, optionally attach `--relates-to <source_object_id>` one or more times to record typed edges (`supersedes`, `implements`, `contradicts`, `depends_on`, `evidence_for`, `solves`, `caused_by`, `blocks`, `parent_of`, `about`, `mentions`, `relates_to`, `documents`, `changes`, `invalidates`).
 
 All write helpers accept `--dry-run` which prints the computed `embedding_text`, its hash, the proposed row(s), and the exact SQL without touching the DB.
+
+## Document ingestion (`ingest-docs`)
+
+`memgraph ingest-docs [--paths ...] [--dry-run] [--no-prune]` chunks committed
+repo documents into the raw layer (`sources` + `chunks`) and materializes each
+chunk into `index_docs` + `memory_fts` + `memory_vec`, making document CONTENT
+retrievable by hybrid recall alongside typed records.
+
+- Default scope: `docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`;
+  `CLAUDE.md` and `memgraph/**` are always excluded.
+- Chunking is structural: ATX-heading sections with a size cap; the heading
+  breadcrumb lands in `chunks.heading_path`;
+  `extraction_status='parsed_structural'`.
+- Incremental: unchanged files are skipped by content hash; unchanged sections
+  are reused without re-embedding; stale chunks are deleted — unless referenced
+  as evidence, then kept but de-indexed (`extraction_status='ignored'`).
+- Chunks are sources, not knowledge: ingest never auto-creates claims or
+  decisions. Typed records are still written manually after verification.
+- One memory per repo: the command dies when `MEMGRAPH_DB` points outside
+  `<repo>/.agent/memory.db`, and refuses files outside the repository.
+  External corpora (e.g. `~/.codex/memories`) cannot be ingested; useful
+  external records may only be imported one-time as typed records with
+  provenance.
+- Run it after committing new or revised strategic/evidence documents, or when
+  recall misses content that is known to be committed. A no-change rerun is a
+  no-op. Embedding is batched (`embed.py --batch`); a 40-file corpus costs on
+  the order of $0.005.
+- Recall results now include `chunk` hits — document sections whose
+  `title`/`aliases` carry the source file path. Treat a chunk hit as a pointer
+  into the committed document, not as a typed fact.
 
 ## Hybrid recall semantics
 
