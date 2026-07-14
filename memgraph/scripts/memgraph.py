@@ -13,6 +13,7 @@ Subcommands:
     timeline --run <id> | --wf <id>
     ingest-docs            Chunk + incrementally sync committed markdown docs
                            into sources/chunks/index_docs/memory_vec.
+    verify-doc-index       Prove source/chunk/FTS/vector/embedding coverage.
 
     write-decision        Insert a decision object.
     write-claim           Insert a claim (gotcha/fact/...).
@@ -31,7 +32,8 @@ All writes are transactional across objects + structured-table + index_docs
 
 Env:
     OPENAI_API_KEY     required for recall and any write that creates a new embedding
-    MEMGRAPH_DB        optional; defaults to <git-root>/.agent/memory.db
+    MEMGRAPH_DB        optional compatibility value; must resolve to
+                       <target-repo>/.agent/memory.db
     SQLITE_VEC_PATH    optional; autodetected from skill's vendor/ dir if unset
 """
 from __future__ import annotations
@@ -93,11 +95,27 @@ def git_root() -> Path:
         return Path.cwd()
 
 
+def target_repo_root() -> Path:
+    """Return the target repository selected by the wrapper or current git root."""
+    wrapped = os.environ.get("MEMGRAPH_REPO_ROOT")
+    if wrapped:
+        return Path(wrapped).expanduser().resolve()
+    return git_root().resolve()
+
+
 def resolve_db_path() -> Path:
+    expected = (target_repo_root() / ".agent" / "memory.db").resolve()
     env = os.environ.get("MEMGRAPH_DB")
     if env:
-        return Path(env).expanduser()
-    return git_root() / ".agent" / "memory.db"
+        actual = Path(env).expanduser().resolve()
+        if actual != expected:
+            die(
+                f"MEMGRAPH_DB must be the target repository memory {expected}; "
+                f"resolved to {actual}",
+                where="db-path",
+                code=2,
+            )
+    return expected
 
 
 def resolve_vec_path() -> Optional[Path]:
@@ -953,6 +971,12 @@ def cmd_session_context(args: argparse.Namespace) -> None:
                    COALESCE(d.decided_at, d.updated_at)
             FROM decisions d
             WHERE d.status IN ('active','accepted')
+              AND NOT EXISTS (
+                SELECT 1 FROM relations inv
+                WHERE inv.target_object_id = d.object_id
+                  AND inv.relation IN ('invalidates','supersedes')
+                  AND inv.status = 'active'
+              )
             ORDER BY COALESCE(d.decided_at, d.updated_at) DESC, d.id DESC
             LIMIT 7
             """
@@ -988,6 +1012,12 @@ def cmd_session_context(args: argparse.Namespace) -> None:
             WHERE c.status = 'active'
               AND c.claim_type IN ('fact','status','rule')
               AND e.entity_type IN ('system','project')
+              AND NOT EXISTS (
+                SELECT 1 FROM relations inv
+                WHERE inv.target_object_id = c.object_id
+                  AND inv.relation IN ('invalidates','supersedes')
+                  AND inv.status = 'active'
+              )
             ORDER BY c.recorded_at DESC, c.id DESC
             """
         )
@@ -1004,6 +1034,12 @@ def cmd_session_context(args: argparse.Namespace) -> None:
                 FROM claims
                 WHERE status = 'active'
                   AND claim_type = 'status'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM relations inv
+                    WHERE inv.target_object_id = claims.object_id
+                      AND inv.relation IN ('invalidates','supersedes')
+                      AND inv.status = 'active'
+                  )
                   AND (statement LIKE '%deferred%'
                        OR statement LIKE '%next tranche%'
                        OR statement LIKE '%next phase%'
@@ -1021,6 +1057,12 @@ def cmd_session_context(args: argparse.Namespace) -> None:
                        COALESCE(decided_at, updated_at)
                 FROM decisions
                 WHERE status = 'proposed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM relations inv
+                    WHERE inv.target_object_id = decisions.object_id
+                      AND inv.relation IN ('invalidates','supersedes')
+                      AND inv.status = 'active'
+                  )
                 ORDER BY COALESCE(decided_at, updated_at) DESC, id DESC
                 """
             )
@@ -1041,6 +1083,12 @@ def cmd_session_context(args: argparse.Namespace) -> None:
             FROM claims
             WHERE status = 'active'
               AND claim_type = 'risk'
+              AND NOT EXISTS (
+                SELECT 1 FROM relations inv
+                WHERE inv.target_object_id = claims.object_id
+                  AND inv.relation IN ('invalidates','supersedes')
+                  AND inv.status = 'active'
+              )
               AND recorded_at >= unixepoch('now','-14 days')
             ORDER BY recorded_at DESC
             """
@@ -1221,6 +1269,85 @@ def cmd_session_context(args: argparse.Namespace) -> None:
     print("\n".join(out))
 
 
+def _recall_source_metadata(
+    conn: sqlite3.Connection, object_ids: Sequence[int]
+) -> Dict[int, Dict[str, str]]:
+    """Resolve chunk object IDs to explicit provenance metadata for recall output."""
+    if not object_ids:
+        return {}
+    placeholders = ",".join("?" * len(object_ids))
+    rows = conn.execute(
+        f"""
+        SELECT c.object_id, s.path, s.source_role, s.source_category
+        FROM chunks c
+        JOIN sources s ON s.id = c.source_id
+        WHERE c.object_id IN ({placeholders})
+        """,
+        list(object_ids),
+    ).fetchall()
+    return {
+        int(object_id): {
+            "source_path": str(path),
+            "source_role": str(source_role),
+            "source_category": str(source_category),
+        }
+        for object_id, path, source_role, source_category in rows
+    }
+
+
+def _recall_invalidation_sources(
+    conn: sqlite3.Connection, object_ids: Sequence[int]
+) -> Dict[int, List[int]]:
+    """Resolve active invalidates/supersedes edges targeting recall candidates."""
+    if not object_ids:
+        return {}
+    placeholders = ",".join("?" * len(object_ids))
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT target_object_id, source_object_id
+        FROM relations
+        WHERE target_object_id IN ({placeholders})
+          AND relation IN ('invalidates', 'supersedes')
+          AND status='active'
+        ORDER BY target_object_id, source_object_id
+        """,
+        list(object_ids),
+    ).fetchall()
+    result: Dict[int, List[int]] = {}
+    for target_object_id, source_object_id in rows:
+        result.setdefault(int(target_object_id), []).append(int(source_object_id))
+    return result
+
+
+def _rank_recall_scores(
+    ordered_scores: Sequence[Tuple[int, float]],
+    source_metadata: Dict[int, Dict[str, str]],
+) -> List[Tuple[int, float, float, float]]:
+    """Apply the project-source authority boundary after semantic fusion.
+
+    External Codex-memory Markdown is a searchable provenance archive, not a
+    project decision source. Its content remains discoverable, but it receives
+    a visible, deterministic penalty so current repo evidence wins close ties.
+    """
+    ranked: List[Tuple[int, float, float, float]] = []
+    for object_id, raw_score in ordered_scores:
+        role = source_metadata.get(object_id, {}).get("source_role")
+        authority_weight = 0.75 if role == "external_memory_archive" else 1.0
+        ranked.append(
+            (
+                int(object_id),
+                float(raw_score) * authority_weight,
+                float(raw_score),
+                authority_weight,
+            )
+        )
+    return sorted(
+        ranked,
+        key=lambda row: (row[1], row[3], row[2]),
+        reverse=True,
+    )
+
+
 def cmd_recall(args: argparse.Namespace) -> None:
     query = args.query
     if not query or not query.strip():
@@ -1334,24 +1461,34 @@ def cmd_recall(args: argparse.Namespace) -> None:
         ids,
     ).fetchall()
     by_id = {int(r[0]): r for r in rows}
+    source_metadata = _recall_source_metadata(conn, ids)
+    invalidation_sources = _recall_invalidation_sources(conn, ids)
+    ranked_scores = _rank_recall_scores(ordered, source_metadata)
 
     hits: List[Dict[str, Any]] = []
-    for oid, s in ordered:
+    for oid, adjusted_score, raw_score, authority_weight in ranked_scores:
         if oid not in by_id:
             continue
         _, otype, title, summary, tags = by_id[oid]
         if type_filter and otype not in type_filter:
             continue
-        hits.append(
-            {
-                "object_id": int(oid),
-                "object_type": otype,
-                "title": title,
-                "summary": summary,
-                "tags": tags,
-                "score": round(float(s), 6),
-            }
-        )
+        if oid in invalidation_sources and not args.include_invalidated:
+            continue
+        hit = {
+            "object_id": int(oid),
+            "object_type": otype,
+            "title": title,
+            "summary": summary,
+            "tags": tags,
+            "score": round(float(adjusted_score), 6),
+            "raw_score": round(float(raw_score), 6),
+            "authority_weight": authority_weight,
+        }
+        if oid in source_metadata:
+            hit.update(source_metadata[oid])
+        if oid in invalidation_sources:
+            hit["invalidated_by"] = invalidation_sources[oid]
+        hits.append(hit)
         if len(hits) >= top_k:
             break
 
@@ -3093,8 +3230,10 @@ def _ingest_detect_date(filename: str) -> Optional[int]:
         return None
 
 
-def _ingest_classify_source(rel_posix: str) -> Tuple[str, str]:
+def _ingest_classify_source(rel_posix: str, *, external: bool = False) -> Tuple[str, str]:
     """Map a selected relpath to (source_role, source_category) per the ingest-docs spec table."""
+    if external:
+        return "external_memory_archive", "other"
     if rel_posix == "AGENTS.md":
         return "runtime_prompt", "policies"
     if rel_posix.startswith("docs/evidence/"):
@@ -3125,6 +3264,172 @@ def _ingest_is_within_repo(path: Path, repo_root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _ingest_external_tracked_markdown(external_root: Path) -> List[Path]:
+    """Return exactly the tracked Markdown files of an explicitly selected archive repo."""
+    root = external_root.expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"external archive root does not exist: {root}")
+    try:
+        top = Path(
+            subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                stderr=subprocess.STDOUT,
+            ).decode().strip()
+        ).resolve()
+        if top != root:
+            raise ValueError(f"external archive root must be its git top-level: {root} != {top}")
+        raw = subprocess.check_output(
+            ["git", "-C", str(root), "ls-files", "-z", "--", "*.md"],
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8")
+    except (subprocess.CalledProcessError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot enumerate tracked Markdown in {root}: {exc}") from exc
+
+    selected: List[Path] = []
+    for rel in sorted(item for item in raw.split("\0") if item):
+        path = (root / rel).resolve()
+        if not _ingest_is_within_repo(path, root):
+            raise ValueError(f"tracked Markdown escapes external archive root: {rel}")
+        if path.suffix == ".md" and path.is_file():
+            selected.append(path)
+    return selected
+
+
+def _ingest_external_revision(external_root: Path) -> str:
+    """Require committed Markdown bytes and return the reproducible archive HEAD."""
+    root = external_root.expanduser().resolve()
+    try:
+        top = Path(
+            subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                stderr=subprocess.STDOUT,
+                text=True,
+            ).strip()
+        ).resolve()
+        if top != root:
+            raise ValueError(f"external archive root must be its git top-level: {root} != {top}")
+        diff = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "diff",
+                "--quiet",
+                "HEAD",
+                "--",
+                ":(glob)**/*.md",
+            ],
+            check=False,
+        )
+        if diff.returncode == 1:
+            raise ValueError(
+                f"external archive has dirty tracked Markdown; commit it before ingestion: {root}"
+            )
+        if diff.returncode != 0:
+            raise ValueError(f"cannot verify external archive cleanliness: {root}")
+        return subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"cannot resolve external archive revision in {root}: {exc}") from exc
+
+
+def _external_archive_revision_key(external_root: Path) -> str:
+    root_hash = sha256_text(str(external_root.resolve()))[:24]
+    return f"external_archive_revision:{root_hash}"
+
+
+def _record_external_archive_revision(
+    conn: sqlite3.Connection, external_root: Path, revision: str
+) -> None:
+    value = json.dumps(
+        {"root": str(external_root.resolve()), "revision": revision},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (_external_archive_revision_key(external_root), value),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _read_external_archive_revision(
+    conn: sqlite3.Connection, external_root: Path
+) -> Optional[str]:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?",
+        (_external_archive_revision_key(external_root),),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return None
+    if payload.get("root") != str(external_root.resolve()):
+        return None
+    revision = payload.get("revision")
+    return str(revision) if revision else None
+
+
+def _ingest_source_key(path: Path, repo_root: Path, external_root: Optional[Path]) -> str:
+    resolved = path.resolve()
+    if external_root is not None:
+        root = external_root.resolve()
+        if not _ingest_is_within_repo(resolved, root):
+            raise ValueError(f"external source escapes selected root: {resolved}")
+        return str(resolved)
+    return resolved.relative_to(repo_root.resolve()).as_posix()
+
+
+def _ingest_source_in_scope(
+    source_path: str,
+    repo_root: Path,
+    external_root: Optional[Path],
+) -> bool:
+    """Keep pruning isolated to the selected repo or external archive namespace."""
+    candidate = Path(source_path)
+    if external_root is not None:
+        if not candidate.is_absolute():
+            return False
+        return _ingest_is_within_repo(candidate.resolve(), external_root.resolve())
+    if candidate.is_absolute():
+        return False
+    return _ingest_is_within_repo((repo_root / candidate).resolve(), repo_root.resolve())
+
+
+def _ingest_source_in_default_scope(source_path: str) -> bool:
+    """Return whether a stored relative source belongs to default managed docs."""
+    candidate = Path(source_path)
+    if candidate.is_absolute() or candidate.suffix != ".md":
+        return False
+    parts = candidate.parts
+    if not parts or candidate.name == "CLAUDE.md" or "memgraph" in parts:
+        return False
+    if source_path == "AGENTS.md":
+        return True
+    if parts[0] == "docs":
+        return True
+    return (
+        len(parts) >= 4
+        and parts[0] == ".agent"
+        and parts[1] == "tasks"
+        and candidate.name == "spec.md"
+    )
 
 
 def _ingest_expand_paths_arg(raw_paths: Sequence[str], repo_root: Path) -> List[Path]:
@@ -3313,12 +3618,31 @@ def _ingest_insert_chunk(
     return obj_id
 
 
-def _ingest_run_prune(conn: sqlite3.Connection, repo_root: Path, *, dry_run: bool) -> Dict[str, Any]:
-    """Own transaction: sources rows whose file is missing from disk get all
-    their chunks reference-safe-deleted; the sources row itself is removed
-    only if it ends up with zero chunks rows left."""
+def _ingest_run_prune(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    *,
+    external_root: Optional[Path],
+    selected_source_keys: Set[str],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Prune only the active ingestion namespace.
+
+    A normal repo ingest never touches absolute external archive sources. An
+    external archive ingest never touches repo-relative sources or a different
+    archive root. Rows are stale when the source is no longer selected (for an
+    external git archive this also catches files that became untracked) or is
+    missing on disk.
+    """
     rows = conn.execute("SELECT id, path FROM sources").fetchall()
-    missing = [(int(sid), path) for sid, path in rows if not (repo_root / path).exists()]
+    missing: List[Tuple[int, str]] = []
+    for sid, path in rows:
+        path_text = str(path)
+        if not _ingest_source_in_scope(path_text, repo_root, external_root):
+            continue
+        disk_path = Path(path_text) if Path(path_text).is_absolute() else repo_root / path_text
+        if path_text not in selected_source_keys or not disk_path.exists():
+            missing.append((int(sid), path_text))
 
     if not missing:
         return {"files_pruned": 0, "chunks_deleted": 0, "chunks_deindexed_kept": 0, "plan_pruned": []}
@@ -3384,7 +3708,7 @@ def _ingest_run_prune(conn: sqlite3.Connection, repo_root: Path, *, dry_run: boo
 
 
 def cmd_ingest_docs(args: argparse.Namespace) -> None:
-    repo_root = git_root().resolve()
+    repo_root = target_repo_root()
     expected_db = (repo_root / ".agent" / "memory.db").resolve()
     actual_db = resolve_db_path().resolve()
     if actual_db != expected_db:
@@ -3395,11 +3719,32 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
             code=2,
         )
 
-    if args.paths:
-        raw_candidates = _ingest_expand_paths_arg(args.paths, repo_root)
-    else:
-        raw_candidates = _ingest_default_selection(repo_root)
-    selected = _ingest_apply_excludes_sort_dedupe(raw_candidates, repo_root)
+    external_root = (
+        Path(args.external_root).expanduser().resolve() if args.external_root else None
+    )
+    if external_root is not None and args.paths:
+        die(
+            "--external-root already selects every tracked Markdown file; do not combine it with --paths",
+            where="ingest-docs",
+            code=2,
+        )
+    try:
+        external_revision: Optional[str] = None
+        if external_root is not None:
+            external_revision = _ingest_external_revision(external_root)
+            selected = _ingest_external_tracked_markdown(external_root)
+        else:
+            if args.paths:
+                raw_candidates = _ingest_expand_paths_arg(args.paths, repo_root)
+            else:
+                raw_candidates = _ingest_default_selection(repo_root)
+            selected = _ingest_apply_excludes_sort_dedupe(raw_candidates, repo_root)
+    except ValueError as exc:
+        die(str(exc), where="ingest-docs", code=2)
+
+    selected_source_keys = {
+        _ingest_source_key(path, repo_root, external_root) for path in selected
+    }
 
     dry_run = bool(args.dry_run)
     do_prune = not args.no_prune
@@ -3424,7 +3769,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
     plan_pruned: List[Dict[str, Any]] = []
 
     for path in selected:
-        rel_posix = path.relative_to(repo_root).as_posix()
+        rel_posix = _ingest_source_key(path, repo_root, external_root)
         text = path.read_text(encoding="utf-8", errors="replace")
         file_hash = sha256_text(text)
 
@@ -3439,7 +3784,9 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
 
         drafts = _ingest_build_chunk_drafts(text, path.stem)
         detected_date = _ingest_detect_date(path.name)
-        source_role, source_category = _ingest_classify_source(rel_posix)
+        source_role, source_category = _ingest_classify_source(
+            rel_posix, external=external_root is not None
+        )
 
         if not existing:
             embedding_texts = [
@@ -3575,19 +3922,364 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
             )
 
     if do_prune:
-        pruned = _ingest_run_prune(conn, repo_root, dry_run=dry_run)
+        pruned = _ingest_run_prune(
+            conn,
+            repo_root,
+            external_root=external_root,
+            selected_source_keys=selected_source_keys,
+            dry_run=dry_run,
+        )
         counters["files_pruned"] = pruned["files_pruned"]
         counters["chunks_deleted"] += pruned["chunks_deleted"]
         counters["chunks_deindexed_kept"] += pruned["chunks_deindexed_kept"]
         plan_pruned = pruned["plan_pruned"]
 
-    result: Dict[str, Any] = {"ok": True, "db": str(expected_db), **counters, "dry_run": dry_run}
+    if external_root is not None and external_revision is not None and not dry_run:
+        _record_external_archive_revision(conn, external_root, external_revision)
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "db": str(expected_db),
+        "external_root": str(external_root) if external_root is not None else None,
+        "external_revision": external_revision,
+        **counters,
+        "dry_run": dry_run,
+    }
     if dry_run:
         result["plan_new"] = plan_new
         result["plan_changed"] = plan_changed
         result["plan_pruned"] = plan_pruned
     json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
+
+
+def _verify_doc_index(
+    conn: sqlite3.Connection,
+    expected_source_paths: Sequence[str],
+    *,
+    expected_source_hashes: Optional[Dict[str, str]] = None,
+    external_root: Optional[Path] = None,
+    repo_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Verify document content and every active search projection end to end."""
+    expected = sorted(set(str(path) for path in expected_source_paths))
+    empty_diagnostics = {
+        "unexpected_sources": [],
+        "source_role_mismatches": [],
+        "source_category_mismatches": [],
+        "source_hash_mismatches": [],
+        "chunk_hash_mismatches": [],
+    }
+    if not expected:
+        return {
+            "ok": False,
+            "expected_sources": 0,
+            "indexed_sources": 0,
+            "active_chunks": 0,
+            "source_paths": [],
+            "missing_sources": [],
+            "sources_without_active_chunks": [],
+            "missing_index_docs": [],
+            "missing_fts": [],
+            "missing_vectors": [],
+            "missing_embedding_meta": [],
+            "embedding_hash_mismatches": [],
+            "embedding_contract_mismatches": [],
+            **empty_diagnostics,
+        }
+
+    path_placeholders = ",".join("?" * len(expected))
+    source_rows = conn.execute(
+        f"""
+        SELECT id, path, source_role, source_category, content_hash
+        FROM sources
+        WHERE path IN ({path_placeholders})
+        ORDER BY path
+        """,
+        expected,
+    ).fetchall()
+    source_by_path = {
+        str(path): {
+            "id": int(source_id),
+            "source_role": str(source_role),
+            "source_category": str(source_category),
+            "content_hash": str(content_hash),
+        }
+        for source_id, path, source_role, source_category, content_hash in source_rows
+    }
+    source_paths = sorted(source_by_path)
+    missing_sources = sorted(set(expected) - set(source_by_path))
+    source_ids = [int(row["id"]) for row in source_by_path.values()]
+
+    unexpected_sources: List[str] = []
+    source_role_mismatches: List[str] = []
+    source_category_mismatches: List[str] = []
+    if external_root is not None:
+        root = external_root.resolve()
+        scoped_paths = {
+            str(path)
+            for (path,) in conn.execute("SELECT path FROM sources").fetchall()
+            if Path(str(path)).is_absolute()
+            and _ingest_is_within_repo(Path(str(path)).resolve(), root)
+        }
+        unexpected_sources = sorted(scoped_paths - set(expected))
+        source_role_mismatches = sorted(
+            path
+            for path, row in source_by_path.items()
+            if row["source_role"] != "external_memory_archive"
+        )
+        source_category_mismatches = sorted(
+            path
+            for path, row in source_by_path.items()
+            if row["source_category"] != "other"
+        )
+    elif repo_root is not None:
+        scoped_paths = {
+            str(path)
+            for (path,) in conn.execute("SELECT path FROM sources").fetchall()
+            if _ingest_source_in_default_scope(str(path))
+        }
+        unexpected_sources = sorted(scoped_paths - set(expected))
+        expected_roles = {
+            path: _ingest_classify_source(path)
+            for path in expected
+            if _ingest_source_in_default_scope(path)
+        }
+        source_role_mismatches = sorted(
+            path
+            for path, (expected_role, _expected_category) in expected_roles.items()
+            if path in source_by_path
+            and source_by_path[path]["source_role"] != expected_role
+        )
+        source_category_mismatches = sorted(
+            path
+            for path, (_expected_role, expected_category) in expected_roles.items()
+            if path in source_by_path
+            and source_by_path[path]["source_category"] != expected_category
+        )
+
+    source_hash_mismatches = sorted(
+        path
+        for path, expected_hash in (expected_source_hashes or {}).items()
+        if path in source_by_path and source_by_path[path]["content_hash"] != expected_hash
+    )
+
+    if not source_ids:
+        return {
+            "ok": False,
+            "expected_sources": len(expected),
+            "indexed_sources": 0,
+            "active_chunks": 0,
+            "source_paths": [],
+            "missing_sources": missing_sources,
+            "sources_without_active_chunks": [],
+            "missing_index_docs": [],
+            "missing_fts": [],
+            "missing_vectors": [],
+            "missing_embedding_meta": [],
+            "embedding_hash_mismatches": [],
+            "embedding_contract_mismatches": [],
+            "unexpected_sources": unexpected_sources,
+            "source_role_mismatches": source_role_mismatches,
+            "source_category_mismatches": source_category_mismatches,
+            "source_hash_mismatches": source_hash_mismatches,
+            "chunk_hash_mismatches": [],
+        }
+
+    source_placeholders = ",".join("?" * len(source_ids))
+    active_rows = conn.execute(
+        f"""
+        SELECT c.object_id, c.source_id
+        FROM chunks c
+        WHERE c.source_id IN ({source_placeholders})
+          AND c.extraction_status='parsed_structural'
+        ORDER BY c.object_id
+        """,
+        source_ids,
+    ).fetchall()
+    active_ids = [int(object_id) for object_id, _source_id in active_rows]
+    sources_with_chunks = {int(source_id) for _object_id, source_id in active_rows}
+    sources_without_active_chunks = sorted(
+        path
+        for path, row in source_by_path.items()
+        if int(row["id"]) not in sources_with_chunks
+    )
+
+    def missing_projection(table: str, key: str = "object_id") -> List[int]:
+        rows = conn.execute(
+            f"""
+            SELECT c.object_id
+            FROM chunks c
+            WHERE c.source_id IN ({source_placeholders})
+              AND c.extraction_status='parsed_structural'
+              AND NOT EXISTS (
+                SELECT 1 FROM {table} projected WHERE projected.{key}=c.object_id
+              )
+            ORDER BY c.object_id
+            """,
+            source_ids,
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    missing_index_docs = missing_projection("index_docs")
+    missing_fts = missing_projection("memory_fts", "rowid")
+    missing_vectors = missing_projection("memory_vec", "rowid")
+    missing_embedding_meta = missing_projection("embedding_meta")
+
+    hash_rows = conn.execute(
+        f"""
+        SELECT c.object_id, s.path, c.heading_path, c.body, c.content_hash,
+               i.embedding_text, i.embedding_text_hash,
+               e.embedding_text_hash
+        FROM chunks c
+        JOIN sources s ON s.id=c.source_id
+        JOIN index_docs i ON i.object_id=c.object_id
+        JOIN embedding_meta e ON e.object_id=c.object_id
+        WHERE c.source_id IN ({source_placeholders})
+          AND c.extraction_status='parsed_structural'
+        ORDER BY c.object_id
+        """,
+        source_ids,
+    ).fetchall()
+    chunk_hash_mismatches: List[int] = []
+    embedding_hash_mismatches: List[int] = []
+    for (
+        object_id,
+        source_path,
+        heading_path,
+        body,
+        chunk_hash,
+        embedding_text,
+        index_embedding_hash,
+        meta_embedding_hash,
+    ) in hash_rows:
+        object_id = int(object_id)
+        expected_chunk_hash = sha256_text(f"{heading_path}\n{body}")
+        if str(chunk_hash) != expected_chunk_hash:
+            chunk_hash_mismatches.append(object_id)
+        expected_embedding_text = _ingest_chunk_embedding_text(
+            str(source_path), str(heading_path), str(body)
+        )
+        expected_embedding_hash = sha256_text(expected_embedding_text)
+        if (
+            str(embedding_text) != expected_embedding_text
+            or str(index_embedding_hash) != expected_embedding_hash
+            or str(meta_embedding_hash) != expected_embedding_hash
+        ):
+            embedding_hash_mismatches.append(object_id)
+    embedding_contract_mismatches = [
+        int(row[0])
+        for row in conn.execute(
+            f"""
+            SELECT c.object_id
+            FROM chunks c
+            JOIN embedding_meta e ON e.object_id=c.object_id
+            WHERE c.source_id IN ({source_placeholders})
+              AND c.extraction_status='parsed_structural'
+              AND (e.model <> ? OR e.dimensions <> ?)
+            ORDER BY c.object_id
+            """,
+            [*source_ids, MODEL, DIMENSIONS],
+        ).fetchall()
+    ]
+
+    failures = (
+        missing_sources
+        or unexpected_sources
+        or source_role_mismatches
+        or source_category_mismatches
+        or source_hash_mismatches
+        or sources_without_active_chunks
+        or missing_index_docs
+        or missing_fts
+        or missing_vectors
+        or missing_embedding_meta
+        or chunk_hash_mismatches
+        or embedding_hash_mismatches
+        or embedding_contract_mismatches
+    )
+    return {
+        "ok": not bool(failures),
+        "expected_sources": len(expected),
+        "indexed_sources": len(source_paths),
+        "active_chunks": len(active_ids),
+        "source_paths": source_paths,
+        "missing_sources": missing_sources,
+        "unexpected_sources": unexpected_sources,
+        "source_role_mismatches": source_role_mismatches,
+        "source_category_mismatches": source_category_mismatches,
+        "source_hash_mismatches": source_hash_mismatches,
+        "sources_without_active_chunks": sources_without_active_chunks,
+        "missing_index_docs": missing_index_docs,
+        "missing_fts": missing_fts,
+        "missing_vectors": missing_vectors,
+        "missing_embedding_meta": missing_embedding_meta,
+        "chunk_hash_mismatches": chunk_hash_mismatches,
+        "embedding_hash_mismatches": embedding_hash_mismatches,
+        "embedding_contract_mismatches": embedding_contract_mismatches,
+    }
+
+
+def cmd_verify_doc_index(args: argparse.Namespace) -> None:
+    repo_root = target_repo_root()
+    db_path = resolve_db_path()
+    external_root = (
+        Path(args.external_root).expanduser().resolve() if args.external_root else None
+    )
+    try:
+        external_revision: Optional[str] = None
+        if external_root is not None:
+            external_revision = _ingest_external_revision(external_root)
+            selected = _ingest_external_tracked_markdown(external_root)
+        else:
+            selected = _ingest_apply_excludes_sort_dedupe(
+                _ingest_default_selection(repo_root), repo_root
+            )
+        expected_paths = [
+            _ingest_source_key(path, repo_root, external_root) for path in selected
+        ]
+        expected_source_hashes = {
+            _ingest_source_key(path, repo_root, external_root): sha256_text(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+            for path in selected
+        }
+    except ValueError as exc:
+        die(str(exc), where="verify-doc-index", code=2)
+
+    conn = connect(db_path, need_vec=True)
+    result = _verify_doc_index(
+        conn,
+        expected_paths,
+        expected_source_hashes=expected_source_hashes,
+        external_root=external_root,
+        repo_root=repo_root if external_root is None else None,
+    )
+    recorded_external_revision = (
+        _read_external_archive_revision(conn, external_root)
+        if external_root is not None
+        else None
+    )
+    external_revision_matches = (
+        recorded_external_revision == external_revision
+        if external_root is not None
+        else None
+    )
+    if external_root is not None and not external_revision_matches:
+        result["ok"] = False
+    result.update(
+        {
+            "db": str(db_path),
+            "external_root": str(external_root) if external_root is not None else None,
+            "external_revision": external_revision,
+            "recorded_external_revision": recorded_external_revision,
+            "external_revision_matches": external_revision_matches,
+        }
+    )
+    json.dump(result, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    if not result["ok"]:
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -3612,6 +4304,11 @@ def build_parser() -> argparse.ArgumentParser:
                         f"clamped to {MAX_SQLITE_VEC_K} (sqlite-vec limit)"
                     ))
     rc.add_argument("--type", default=None, help="comma-separated object_type filter")
+    rc.add_argument(
+        "--include-invalidated",
+        action="store_true",
+        help="include historical objects targeted by active invalidates/supersedes edges",
+    )
     rc.set_defaults(func=cmd_recall)
 
     # next-wf / next-run
@@ -3829,9 +4526,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicit files and/or directories to ingest (directories expand to **/*.md); replaces the default selection",
     )
+    idoc.add_argument(
+        "--external-root",
+        default=None,
+        help=(
+            "Explicit owner-approved external git archive; ingests exactly its tracked Markdown "
+            "files as low-authority source chunks into this repo's one memory DB"
+        ),
+    )
     idoc.add_argument("--dry-run", action="store_true", help="Print the plan and exit without writing")
     idoc.add_argument("--no-prune", action="store_true", help="Skip removing sources rows for files missing on disk")
     idoc.set_defaults(func=cmd_ingest_docs)
+
+    vdoc = sub.add_parser(
+        "verify-doc-index",
+        help="Verify document source/chunk/FTS/vector/embedding coverage",
+    )
+    vdoc.add_argument(
+        "--external-root",
+        default=None,
+        help="Verify exactly the tracked Markdown files of this explicit external git archive",
+    )
+    vdoc.set_defaults(func=cmd_verify_doc_index)
 
     return ap
 

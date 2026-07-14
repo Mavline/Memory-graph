@@ -35,13 +35,22 @@ if (-not $repo) {
   else { $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path }
 }
 $repo = ("$repo").Trim()
+$env:MEMGRAPH_REPO_ROOT = $repo
 
 $mg     = $PSScriptRoot
 $engine = Join-Path $mg   'scripts/memgraph.py'
 
 # --- DB ------------------------------------------------------------------
-if (-not $env:MEMGRAPH_DB) { $env:MEMGRAPH_DB = Join-Path $repo '.agent/memory.db' }
-$db = $env:MEMGRAPH_DB
+$expectedDb = [System.IO.Path]::GetFullPath((Join-Path $repo '.agent/memory.db'))
+if ($env:MEMGRAPH_DB) {
+  $actualDb = [System.IO.Path]::GetFullPath($env:MEMGRAPH_DB)
+  if (-not [System.String]::Equals($actualDb, $expectedDb, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Write-Error "MEMGRAPH_DB must be the target repository memory $expectedDb; resolved to $actualDb"
+    exit 2
+  }
+}
+$env:MEMGRAPH_DB = $expectedDb
+$db = $expectedDb
 
 # Clean idle for startup integration before the DB exists.
 if (-not (Test-Path $db)) {

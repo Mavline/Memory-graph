@@ -52,4 +52,4 @@ Every row in a structured table has a matching `objects` row whose `object_type`
 
 ## chunk
 
-`chunks`. Raw textual slices of source docs. Two sanctioned producers: the one-off migration pipeline (legacy memory-bank prose) and the `ingest-docs` command (committed repo markdown, `extraction_status='parsed_structural'`; stale-but-referenced rows are retired as `'ignored'`). Never hand-inserted with SQL. Referenced by `primary_evidence_chunk_id` across claims, decisions, tasks, events.
+`chunks`. Raw textual slices of source docs. Sanctioned producers: the one-off migration pipeline (legacy memory-bank prose) and `ingest-docs` for committed repo Markdown or an explicitly owner-approved external git archive (`--external-root`; `extraction_status='parsed_structural'`; stale-but-referenced rows are retired as `'ignored'`). External chunks stay low-authority source pointers and never become claims automatically. Never hand-inserted with SQL. Referenced by `primary_evidence_chunk_id` across claims, decisions, tasks, events.

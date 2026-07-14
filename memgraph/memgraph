@@ -37,6 +37,7 @@ elif [ -n "${CODEX_PROJECT_DIR:-}" ]; then
 else
   REPO="$(cd "$HERE/.." && pwd)"
 fi
+export MEMGRAPH_REPO_ROOT="$REPO"
 
 # The engine has its own fallback, but setting MEMGRAPH_DB here makes invocation
 # deterministic even when the wrapper is launched outside a git worktree.

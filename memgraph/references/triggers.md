@@ -62,6 +62,6 @@ Write cadence: do not batch writes. Each write is cheap, durable, and adds to la
 
 - Hand-crafting `INSERT` into `index_docs`/`memory_vec`/`embedding_meta` — the four-table invariant will break.
 - Calling a different embedding model or different dimensionality — verify phase flags the mismatch.
-- Hand-crafting `INSERT` into `chunks` or `sources` — the raw layer is written only by the migration pipeline and by `ingest-docs`; after committing new or revised repo documents, run `memgraph ingest-docs` instead.
+- Hand-crafting `INSERT` into `chunks` or `sources` — the raw layer is written only by the migration pipeline and by `ingest-docs`; after committing new or revised repo documents, run `memgraph ingest-docs` instead. An external Markdown archive enters only after an explicit owner instruction through `memgraph ingest-docs --external-root <git-root>`, followed by `verify-doc-index`.
 - Writing `status='active'` while a superseding row is already active — use `write-policy --retires` or `write-decision` with explicit supersede relation.
 - Closing a run with `closed_accepted` while `review_gates` for any of its WFs have `verdict IN ('fail', 'findings')` without a follow-up `pass`/`accepted` — violates `No Forward Progress With Open Tails`.

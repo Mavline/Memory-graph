@@ -39,7 +39,8 @@ session, or a regular shell:
     pwsh -NoProfile -ExecutionPolicy Bypass -File <skill>/memgraph.ps1 <command> [args]             # Windows PowerShell 7+
 
 where `<skill>` is this folder (normally `memgraph/` at your project root). Both
-wrappers handle venv activation, target-repo detection, `MEMGRAPH_DB`,
+wrappers handle venv activation, target-repo detection, the canonical
+repo-local DB path,
 the sqlite-vec extension path, `.env` loading, and PowerShell UTF-8. Direct
 invocation of `scripts/memgraph.py` bypasses this setup and can fail with
 `AttributeError: enable_load_extension` on systems where the default `python3`
@@ -72,7 +73,7 @@ key, or agent startup integration; see `install/README.md` for the full stand-up
 ## Environment
 
 The wrapper resolves defaults automatically and invokes from Claude, Codex, or a shell:
-- `MEMGRAPH_DB` is derived from the git root, `CLAUDE_PROJECT_DIR`, `CODEX_PROJECT_DIR`, or the parent of `<repo>/memgraph/`.
+- `MEMGRAPH_DB` is derived from the git root, `CLAUDE_PROJECT_DIR`, `CODEX_PROJECT_DIR`, or the parent of `<repo>/memgraph/`. A supplied value must resolve to `<target-repo>/.agent/memory.db`; shared/global or cross-repo DB paths are rejected by every command.
 - `SQLITE_VEC_PATH` defaults to the vendored `memgraph/vendor/vec0.<dylib|so|dll>`.
 - `OPENAI_API_KEY` is auto-loaded from `<repo>/.env` if not already exported.
 
@@ -124,7 +125,9 @@ markdown as authoritative.
 7. **Entity lookup.** `memgraph/memgraph entity <canonical-or-alias>` returns the entity record plus its active claims and recent events.
 8. **Timeline / orchestration audit.** `memgraph/memgraph timeline --run <run_id>` or `--wf <wf_id>`.
 
-The `recall` command returns every RRF-fused hit by default. Pass `--k <n>` only when you deliberately want a cap (e.g. `--k 10` for a terse summary). A single call always writes an access log line to stderr for budget visibility.
+The `recall` command returns up to 20 RRF-fused hits by default. Pass `--k <n>`
+to choose a different final cap (bounded by sqlite-vec). A single call always
+writes an access log line to stderr for budget visibility.
 
 ## When to WRITE (triggers)
 
@@ -158,10 +161,10 @@ All write helpers accept `--dry-run` which prints the computed `embedding_text`,
 
 ## Document ingestion (`ingest-docs`)
 
-`memgraph ingest-docs [--paths ...] [--dry-run] [--no-prune]` chunks committed
-repo documents into the raw layer (`sources` + `chunks`) and materializes each
-chunk into `index_docs` + `memory_fts` + `memory_vec`, making document CONTENT
-retrievable by hybrid recall alongside typed records.
+`memgraph ingest-docs [--paths ...] [--external-root <git-root>] [--dry-run]
+[--no-prune]` chunks documents into the raw layer (`sources` + `chunks`) and
+materializes each chunk into `index_docs` + `memory_fts` + `memory_vec`, making
+document CONTENT retrievable by hybrid recall alongside typed records.
 
 - Default scope: `docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`;
   `CLAUDE.md` and `memgraph/**` are always excluded.
@@ -173,11 +176,27 @@ retrievable by hybrid recall alongside typed records.
   as evidence, then kept but de-indexed (`extraction_status='ignored'`).
 - Chunks are sources, not knowledge: ingest never auto-creates claims or
   decisions. Typed records are still written manually after verification.
-- One memory per repo: the command dies when `MEMGRAPH_DB` points outside
-  `<repo>/.agent/memory.db`, and refuses files outside the repository.
-  External corpora (e.g. `~/.codex/memories`) cannot be ingested; useful
-  external records may only be imported one-time as typed records with
-  provenance.
+- One memory per repo: every command dies when `MEMGRAPH_DB` points outside
+  `<repo>/.agent/memory.db`. Normal `--paths` refuses files outside the target
+  repository.
+- Explicit owner-approved archive exception: `--external-root <git-root>`
+  imports exactly that archive's git-tracked `*.md` files into the target
+  repository's same DB. Source keys are absolute paths, `source_role` is
+  `external_memory_archive`, and chunks remain low-authority evidence pointers;
+  they never auto-create claims, decisions, policies, or workflow state. It is
+  an import into one DB, not federation or a second memory. Tracked Markdown
+  must be clean; the importer records the archive HEAD so the indexed bytes are
+  reproducible.
+- `memgraph verify-doc-index --external-root <git-root>` proves exact source
+  coverage with no stale in-scope sources; current file, chunk, and actual
+  embedding-text hashes; recorded archive revision; active chunk, FTS, vector,
+  embedding-metadata, and model/dimension consistency. Recall chunk hits include
+  explicit `source_path`, `source_role`, and `source_category` provenance. RRF
+  scores from `external_memory_archive` chunks receive a visible `0.75`
+  authority weight;
+  their unmodified semantic score remains available as `raw_score`.
+- Without `--external-root`, the verifier applies the same freshness/projection
+  checks to the default repo document scope and fails on stale managed sources.
 - Run it after committing new or revised strategic/evidence documents, or when
   recall misses content that is known to be committed. A no-change rerun is a
   no-op. Embedding is batched (`embed.py --batch`); a 40-file corpus costs on
@@ -190,18 +209,26 @@ retrievable by hybrid recall alongside typed records.
 
 `memgraph recall "<query>"` executes Reciprocal Rank Fusion:
 
-- Vector leg: sqlite-vec `MATCH vec_f32(<512-dim JSON>)` with `ORDER BY distance`. `k` defaults to the full `memory_vec` row count so every candidate is ranked; pass `--k <n>` to cap earlier.
-- Lexical leg: FTS5 `memory_fts MATCH '<tokenized query>'` with `ORDER BY rank`, no row limit unless `--k` is set.
-- Fusion: `score = Σ 1/(60 + rank_i)` across both legs, grouped by `object_id`.
-- Final projection: `object_type`, `title`, full `summary`, score, and a pointer to the structured row.
+- Vector leg: sqlite-vec `MATCH vec_f32(<512-dim JSON>)` with `ORDER BY
+  distance`; the candidate pool is `5 × --k` (100 candidates at the default
+  `--k 20`), clamped by sqlite-vec.
+- Lexical leg: FTS5 `memory_fts MATCH '<tokenized query>'` with `ORDER BY rank`
+  and the same `5 × --k` candidate limit.
+- Fusion: `raw_score = Σ 1/(60 + rank_i)` across both legs, grouped by
+  `object_id`; external-memory archive chunks then use
+  `score = raw_score × 0.75`, while project and typed records keep weight `1.0`.
+- Final projection: `object_type`, `title`, full `summary`, `score`,
+  `raw_score`, `authority_weight`, and provenance/structured-row pointers.
+- Objects targeted by an active `invalidates` or `supersedes` edge are hidden
+  from current recall and session-context views by default. Their rows and edges
+  remain auditable through `show`; use `--include-invalidated` for historical
+  recall, which adds `invalidated_by` object IDs.
 
 Filters:
 
-- `--type policy,decision,claim,event,workflow_task,run,review_gate,orchestration_event,entity,view`
-- `--since 2026-01-01` (ISO date or epoch)
-- `--status active,locked`
-- `--wf WF-1300..WF-1342` or `--run run-300..run-354`
-- `--k <n>` (optional cap on final result count; omit for "return all")
+- `--type policy,decision,claim,event,workflow_task,run,review_gate,orchestration_event,entity,view,chunk`
+- `--k <n>` (final result cap; default 20)
+- `--include-invalidated` (historical/audit mode)
 
 ## Cost model
 

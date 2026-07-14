@@ -10,12 +10,12 @@ below; do them once per machine.
 
 ## Placement
 
-Put this `memgraph/` folder at the root of the project that should have memory
-(the tested default). The wrapper then finds the project's DB from the git root,
-`CLAUDE_PROJECT_DIR`, `CODEX_PROJECT_DIR`, or the parent of `memgraph/`, and a
-repo-local hook or `AGENTS.md` rule can point at it with a relative path. You
-can also keep it elsewhere and set `MEMGRAPH_DB`, but project-root placement is
-the canonical layout.
+Put this `memgraph/` folder at the root of the project that should have memory.
+The wrapper finds the project's DB from the git root, `CLAUDE_PROJECT_DIR`,
+`CODEX_PROJECT_DIR`, or the parent of `memgraph/`, and a repo-local hook or
+`AGENTS.md` rule points at it with a relative path. `MEMGRAPH_DB` is not an
+escape hatch to a shared/global DB: when supplied, it must still resolve to
+`<target-repo>/.agent/memory.db` or every command fails.
 
 ## Two layers, different portability
 
