@@ -290,7 +290,10 @@ self-review, or closeout; and on every `wf-status` transition. A turn that
 produced a finding, a verdict, or a pivot but wrote nothing to memgraph is
 incomplete; deferring all writes to the end is a violation. `recall` is hybrid
 (semantic + keyword) — query by meaning, and never treat a keyword miss as proof
-that nothing was recorded.
+that nothing was recorded. After committing new or revised strategic/evidence
+documents (appended sections included), run `memgraph ingest-docs` in the same
+turn and commit the updated `.agent/memory.db`; a committed document whose
+content is absent from the index is an unfinished tail.
 
 STRATEGIC-DOCUMENT DISCIPLINE: durable system knowledge is split across the
 approved strategic documents, never dumped into one rolling file. `docs/spec.md`
