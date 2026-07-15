@@ -46,7 +46,10 @@ What happens next depends on the project:
   that creates, updates, moves, or deletes a managed document (`docs/**/*.md`,
   `AGENTS.md`, `.agent/tasks/**/spec.md`), run `memgraph/memgraph ingest-docs`
   and `memgraph/memgraph verify-doc-index`, then commit the updated
-  `.agent/memory.db`. Typed memory (decisions, claims, tasks) is written only
+  `.agent/memory.db`. The bootstrap commit itself is the first such event — it
+  adds `AGENTS.md`, a managed document — so run the lifecycle chain right
+  after it; until then the state is infrastructure-complete but not yet
+  document-synced. Typed memory (decisions, claims, tasks) is written only
   when real events happen; no smoke records are ever written.
 - **Existing repository** — run a one-time backfill: inventory the committed
   document corpus, run `ingest-docs` once, prove full coverage with

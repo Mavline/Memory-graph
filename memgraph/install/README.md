@@ -133,8 +133,10 @@ NOT write smoke/test records (such as a "kit live" claim) to prove the kit
 works: typed memory is written only by real project events, and the empty
 state is valid.
 
-Document-index verification — only when the project has committed managed
-documents (`docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`):
+Document-index verification — as soon as the project has committed managed
+documents (`docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`). Note that
+a freshly bootstrapped project that committed `AGENTS.md` already has a
+one-document corpus, so run this right after the bootstrap commit:
 
     memgraph/memgraph ingest-docs
     memgraph/memgraph verify-doc-index

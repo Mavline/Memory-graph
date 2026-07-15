@@ -289,6 +289,88 @@ class VerifierContractTests(unittest.TestCase):
         self.assertEqual(result["unexpected_sources"], ["docs/knowledge/mixed.md"])
         self.assertEqual(result["retained_evidence_sources"], [])
 
+    def _add_section_tombstone(
+        self,
+        conn: sqlite3.Connection,
+        source_id: int,
+        object_id: int,
+        *,
+        referenced: bool = True,
+        leftover_fts: bool = False,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO chunks VALUES (?,?,?,?,?,?,?)",
+            (
+                object_id,
+                object_id,
+                source_id,
+                "Removed section",
+                "old body",
+                "ignored",
+                "old-chunk-hash",
+            ),
+        )
+        if referenced:
+            conn.execute(
+                "INSERT INTO relations VALUES (?,?,?,?,?)",
+                (object_id, object_id, "mentions", "active", None),
+            )
+        if leftover_fts:
+            conn.execute(
+                "INSERT INTO memory_fts(rowid, title) VALUES (?, 'stale')", (object_id,)
+            )
+
+    def test_valid_section_tombstone_in_live_source_passes(self) -> None:
+        conn = self._connection()
+        self._add_active_source(conn, 1, "docs/knowledge/topic.md", 42)
+        self._add_section_tombstone(conn, 1, 43)
+
+        result = MEMGRAPH._verify_doc_index(
+            conn,
+            ["docs/knowledge/topic.md"],
+            expected_source_hashes={"docs/knowledge/topic.md": "file-hash"},
+            repo_root=self.REPO_ROOT,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["retained_evidence_chunks"], [43])
+        self.assertEqual(result["retained_evidence_sources"], [])
+        self.assertEqual(result["invalid_evidence_tombstones"], [])
+
+    def test_section_tombstone_with_stale_projection_fails(self) -> None:
+        conn = self._connection()
+        self._add_active_source(conn, 1, "docs/knowledge/topic.md", 42)
+        self._add_section_tombstone(conn, 1, 43, leftover_fts=True)
+
+        result = MEMGRAPH._verify_doc_index(
+            conn,
+            ["docs/knowledge/topic.md"],
+            expected_source_hashes={"docs/knowledge/topic.md": "file-hash"},
+            repo_root=self.REPO_ROOT,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["invalid_evidence_tombstones"], ["docs/knowledge/topic.md"]
+        )
+
+    def test_unreferenced_section_tombstone_fails(self) -> None:
+        conn = self._connection()
+        self._add_active_source(conn, 1, "docs/knowledge/topic.md", 42)
+        self._add_section_tombstone(conn, 1, 43, referenced=False)
+
+        result = MEMGRAPH._verify_doc_index(
+            conn,
+            ["docs/knowledge/topic.md"],
+            expected_source_hashes={"docs/knowledge/topic.md": "file-hash"},
+            repo_root=self.REPO_ROOT,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["invalid_evidence_tombstones"], ["docs/knowledge/topic.md"]
+        )
+
     def test_dirty_managed_paths_fail_separately(self) -> None:
         conn = self._connection()
         self._add_active_source(conn, 1, "docs/knowledge/topic.md", 42)
@@ -636,6 +718,96 @@ class EndToEndLifecycleTests(unittest.TestCase):
         self.assertEqual(ingest["ignored_managed_paths"], [])
         self.assertEqual(ingest["dirty_managed_paths"], [])
         self.assertIn("docs/knowledge/pinned.md", self._sources())
+
+    def test_directory_gitignore_rule_excludes_contained_files(self) -> None:
+        _git(self.repo, "init", "-q")
+        self._write(".gitignore", "docs/knowledge/\n")
+        self._write("docs/spec.md", "# Spec\n\nBody.\n")
+        self._commit_all()
+        self._write("docs/knowledge/private.md", "# Private\n\nDraft.\n")
+
+        ingest = self._run_cli("ingest-docs")
+        verify = self._run_cli("verify-doc-index")
+
+        self.assertTrue(ingest["ok"])
+        self.assertTrue(ingest["committable"])
+        self.assertEqual(
+            ingest["ignored_managed_paths"], ["docs/knowledge/private.md"]
+        )
+        self.assertNotIn("docs/knowledge/private.md", self._sources())
+        self.assertIn("docs/spec.md", self._sources())
+        self.assertTrue(verify["ok"])
+        self.assertEqual(
+            verify["ignored_managed_paths"], ["docs/knowledge/private.md"]
+        )
+
+    def test_ignored_agent_dir_excludes_task_specs(self) -> None:
+        _git(self.repo, "init", "-q")
+        self._write(".gitignore", ".agent/\n")
+        self._write("AGENTS.md", "# Agents\n\nRules.\n")
+        self._commit_all()
+        self._write(".agent/tasks/WF-9/spec.md", "# Task\n\nFrozen.\n")
+
+        ingest = self._run_cli("ingest-docs")
+
+        self.assertTrue(ingest["ok"])
+        self.assertTrue(ingest["committable"])
+        self.assertEqual(
+            ingest["ignored_managed_paths"], [".agent/tasks/WF-9/spec.md"]
+        )
+        self.assertNotIn(".agent/tasks/WF-9/spec.md", self._sources())
+        self.assertIn("AGENTS.md", self._sources())
+
+    def test_removed_section_leaves_tombstone_and_stale_projection_fails(self) -> None:
+        _git(self.repo, "init", "-q")
+        self._write(
+            "docs/knowledge/topic.md",
+            "# Topic\n\nIntro body.\n\n## Finding\n\nPinned finding.\n",
+        )
+        self._commit_all()
+        self._run_cli("ingest-docs")
+        db = self._db()
+        object_id = int(
+            db.execute(
+                "SELECT object_id FROM chunks WHERE heading_path LIKE '%Finding%'"
+            ).fetchone()[0]
+        )
+        db.execute(
+            """
+            INSERT INTO relations(source_object_id, relation, target_object_id, created_at)
+            VALUES (?, 'mentions', ?, 1)
+            """,
+            (object_id, object_id),
+        )
+        db.commit()
+        self._write("docs/knowledge/topic.md", "# Topic\n\nIntro body.\n")
+        self._commit_all("drop section")
+
+        ingest = self._run_cli("ingest-docs")
+        verify = self._run_cli("verify-doc-index")
+
+        self.assertEqual(ingest["chunks_deindexed_kept"], 1)
+        self.assertTrue(verify["ok"])
+        self.assertFalse(verify["corpus_empty"])
+        self.assertIn(object_id, verify["retained_evidence_chunks"])
+        self.assertEqual(verify["retained_evidence_sources"], [])
+
+        db.execute(
+            """
+            INSERT INTO memory_fts(rowid, object_type, title, summary, body, tags, aliases)
+            VALUES (?, 'chunk', 'stale', '', '', '', '')
+            """,
+            (object_id,),
+        )
+        db.commit()
+
+        payload, code = self._run_cli_expect_exit("verify-doc-index")
+
+        self.assertEqual(code, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(
+            payload["invalid_evidence_tombstones"], ["docs/knowledge/topic.md"]
+        )
 
     def test_deleting_last_document_returns_to_empty_corpus(self) -> None:
         _git(self.repo, "init", "-q")

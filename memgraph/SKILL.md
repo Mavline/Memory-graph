@@ -36,6 +36,9 @@ The kit runs four processes that must not be conflated:
    `.agent/memory.db` (schema + FTS + vector runtime); startup integration is
    wired per `install/README.md`. Documents are not required, nothing is
    indexed, and Git is not needed yet. An empty memory is a healthy state.
+   The bootstrap commit that adds `AGENTS.md` is already a document-lifecycle
+   event: run process 3 immediately after it, or the corpus stays
+   infrastructure-complete but not document-synced.
 2. **Typed memory writes** — `write-*` commands record real policies,
    decisions, claims, tasks, and events as they happen. Never write smoke or
    test records (no "kit live" claims); an empty typed memory is valid.

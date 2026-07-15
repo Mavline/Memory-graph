@@ -3490,7 +3490,7 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
             "ignored_managed_paths": [],
         }
     try:
-        raw = subprocess.check_output(
+        raw_status = subprocess.check_output(
             [
                 "git",
                 "-C",
@@ -3499,7 +3499,28 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
                 "--porcelain",
                 "-z",
                 "--untracked-files=all",
-                "--ignored=matching",
+                "--",
+                *_MANAGED_GIT_PATHSPECS,
+            ],
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8", errors="replace")
+        # Ignored files must be enumerated per FILE, never per directory: for
+        # a directory-level ignore rule (`docs/knowledge/`, `.agent/`)
+        # `git status` reports only the collapsed directory entry, and the
+        # Markdown files inside would silently stay in the corpus. `ls-files
+        # --others --ignored` expands every ignored untracked file; tracked
+        # files never appear here, so a tracked file matched by a later
+        # ignore rule stays indexed.
+        raw_ignored = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
                 "--",
                 *_MANAGED_GIT_PATHSPECS,
             ],
@@ -3508,14 +3529,18 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
     except (subprocess.CalledProcessError, UnicodeDecodeError) as exc:
         return {
             "git_available": False,
-            "git_reason": f"cannot read git status in {root}: {exc}",
+            "git_reason": f"cannot read git state in {root}: {exc}",
             "dirty_managed_paths": [],
             "ignored_managed_paths": [],
         }
 
+    ignored: Set[str] = {
+        candidate
+        for candidate in raw_ignored.split("\0")
+        if candidate and _ingest_source_in_default_scope(candidate)
+    }
     dirty: Set[str] = set()
-    ignored: Set[str] = set()
-    fields = raw.split("\0")
+    fields = raw_status.split("\0")
     i = 0
     while i < len(fields):
         entry = fields[i]
@@ -3527,13 +3552,12 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
         if status_xy[0] in ("R", "C") and i < len(fields) and fields[i]:
             paths.append(fields[i])
             i += 1
+        if status_xy == "!!":
+            continue
         for candidate in paths:
             if not _ingest_source_in_default_scope(candidate):
                 continue
-            if status_xy == "!!":
-                ignored.add(candidate)
-            else:
-                dirty.add(candidate)
+            dirty.add(candidate)
     return {
         "git_available": True,
         "git_reason": None,
@@ -4168,6 +4192,55 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
     sys.stdout.write("\n")
 
 
+def _fts_docsize_available(conn: sqlite3.Connection) -> bool:
+    """memory_fts is external-content FTS5 (content='index_docs'), so a rowid
+    lookup on it is answered from index_docs and can never see a desynced FTS
+    index entry. The docsize shadow table records exactly which rowids the
+    FTS index itself holds; probe it when present (canonical schema), fall
+    back to a plain rowid lookup for reduced stand-in schemas."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_fts_docsize'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _verify_fts_entry_present(conn: sqlite3.Connection, object_id: int) -> bool:
+    if _fts_docsize_available(conn):
+        return (
+            conn.execute(
+                "SELECT 1 FROM memory_fts_docsize WHERE id=?", (object_id,)
+            ).fetchone()
+            is not None
+        )
+    return (
+        conn.execute(
+            "SELECT 1 FROM memory_fts WHERE rowid=?", (object_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _verify_evidence_tombstone_ok(conn: sqlite3.Connection, object_id: int) -> bool:
+    """A de-indexed chunk may stay only as genuinely referenced evidence with
+    zero search projections (index_docs, FTS, vector, embedding meta)."""
+    if not _ingest_is_chunk_referenced(conn, object_id):
+        return False
+    projected = conn.execute(
+        """
+        SELECT
+          EXISTS(SELECT 1 FROM index_docs WHERE object_id=?),
+          EXISTS(SELECT 1 FROM memory_vec WHERE rowid=?),
+          EXISTS(SELECT 1 FROM embedding_meta WHERE object_id=?)
+        """,
+        (object_id, object_id, object_id),
+    ).fetchone()
+    if any(bool(flag) for flag in projected):
+        return False
+    return not _verify_fts_entry_present(conn, object_id)
+
+
 def _verify_active_projections(
     conn: sqlite3.Connection,
     source_by_path: Dict[str, Dict[str, Any]],
@@ -4211,7 +4284,25 @@ def _verify_active_projections(
         return [int(row[0]) for row in rows]
 
     missing_index_docs = missing_projection("index_docs")
-    missing_fts = missing_projection("memory_fts", "rowid")
+    if _fts_docsize_available(conn):
+        missing_fts = [
+            int(row[0])
+            for row in conn.execute(
+                f"""
+                SELECT c.object_id
+                FROM chunks c
+                WHERE c.source_id IN ({source_placeholders})
+                  AND c.extraction_status='parsed_structural'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM memory_fts_docsize d WHERE d.id=c.object_id
+                  )
+                ORDER BY c.object_id
+                """,
+                source_ids,
+            ).fetchall()
+        ]
+    else:
+        missing_fts = missing_projection("memory_fts", "rowid")
     missing_vectors = missing_projection("memory_vec", "rowid")
     missing_embedding_meta = missing_projection("embedding_meta")
 
@@ -4303,6 +4394,10 @@ def _verify_doc_index(
     index_docs/FTS/vector/embedding-meta projection; such sources are listed
     in retained_evidence_sources instead of failing the check, while any
     active, partially indexed, or unjustified leftover still fails it.
+    Ignored chunks of sources still in the corpus (section tombstones left by
+    removed-but-referenced sections) are audited by the same rule: valid ones
+    land in retained_evidence_chunks, violations fail the check via
+    invalid_evidence_tombstones.
     dirty_managed_paths (uncommitted managed files, supplied by the caller)
     is its own failure category, kept separate from stale-source reporting.
     """
@@ -4403,29 +4498,34 @@ def _verify_doc_index(
             unexpected_sources.append(leftover_path)
             continue
         object_ids = [int(object_id) for _row_id, object_id, _status in chunk_rows]
-        tombstone_ok = True
-        for object_id in object_ids:
-            if not _ingest_is_chunk_referenced(conn, object_id):
-                tombstone_ok = False
-                break
-            projected = conn.execute(
-                """
-                SELECT
-                  EXISTS(SELECT 1 FROM index_docs WHERE object_id=?),
-                  EXISTS(SELECT 1 FROM memory_fts WHERE rowid=?),
-                  EXISTS(SELECT 1 FROM memory_vec WHERE rowid=?),
-                  EXISTS(SELECT 1 FROM embedding_meta WHERE object_id=?)
-                """,
-                (object_id, object_id, object_id, object_id),
-            ).fetchone()
-            if any(bool(flag) for flag in projected):
-                tombstone_ok = False
-                break
-        if tombstone_ok:
+        if all(
+            _verify_evidence_tombstone_ok(conn, object_id) for object_id in object_ids
+        ):
             retained_evidence_sources.append(leftover_path)
             retained_evidence_chunks.extend(object_ids)
         else:
             invalid_evidence_tombstones.append(leftover_path)
+
+    # Section tombstones: a source still in the corpus can carry ignored
+    # chunks left by removed-but-referenced sections. Audit every ignored
+    # chunk globally, not only chunks of fully removed sources — a stale
+    # projection on any of them re-surfaces deleted text in search.
+    for path in sorted(source_by_path):
+        ignored_rows = conn.execute(
+            """
+            SELECT object_id FROM chunks
+            WHERE source_id=? AND extraction_status='ignored'
+            ORDER BY object_id
+            """,
+            (int(source_by_path[path]["id"]),),
+        ).fetchall()
+        for (object_id,) in ignored_rows:
+            if _verify_evidence_tombstone_ok(conn, int(object_id)):
+                retained_evidence_chunks.append(int(object_id))
+            elif path not in invalid_evidence_tombstones:
+                invalid_evidence_tombstones.append(path)
+    retained_evidence_chunks.sort()
+    invalid_evidence_tombstones.sort()
 
     source_hash_mismatches = sorted(
         path
