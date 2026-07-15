@@ -2,9 +2,12 @@
 """Bootstrap an empty memory graph for a new project (or new application).
 
 Creates `.agent/memory.db` with the canonical schema, sqlite-vec loaded,
-and meta populated. Does NOT touch any source files. Suitable for projects
-that have no markdown memory bank yet, or for applications that want this
-as their fresh memory backend.
+and meta populated. Does NOT touch any source files, and does NOT create,
+look for, or index any documents: a project with no documents is a valid
+target, the empty store is a healthy state, and document indexing belongs
+to the separate `ingest-docs` lifecycle. Suitable for projects that have
+no markdown memory bank yet, or for applications that want this as their
+fresh memory backend.
 
 Usage:
     python3 bootstrap.py                          # cwd = repo root

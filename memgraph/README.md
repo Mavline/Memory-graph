@@ -46,9 +46,12 @@ install/
 
 ## Quick entry points
 
+- To stand up an empty memory in a new project: `venv/bin/python scripts/bootstrap.py --target <repo>` (creates only the empty store; no documents required, nothing indexed, no test records).
 - On session start run `memgraph/memgraph session-context` (macOS/Linux) or `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` (Windows). Claude can automate this with `.claude/settings.json`; Codex should carry the same rule in `AGENTS.md` or an equivalent local hook.
 - Before any non-trivial task: `memgraph/memgraph recall "<query>"`.
-- To write durable knowledge: `memgraph/memgraph write-decision | write-claim | write-entity | write-relation`.
+- To write durable knowledge (real events only): `memgraph/memgraph write-decision | write-claim | write-entity | write-relation`.
+- After committing a created/updated/moved/deleted managed document: `memgraph/memgraph ingest-docs`, then `memgraph/memgraph verify-doc-index`, then commit the updated `.agent/memory.db` (document index lifecycle; requires Git and a clean managed corpus).
+- To adopt an existing repo that already has documents: one-time backfill — full `ingest-docs`, `verify-doc-index` (N of N), a semantic-recall spot check, and a rerun of `ingest-docs` to prove idempotency.
 - To run the orchestration loop: `memgraph/memgraph next-wf`, `memgraph/memgraph open-wf`, `memgraph/memgraph wf-status`, `memgraph/memgraph write-review`, `memgraph/memgraph open-run`, `memgraph/memgraph close-run`.
 
 ## Hard invariants
@@ -57,7 +60,7 @@ install/
 - Embedding model is pinned to `text-embedding-3-small` with `dimensions=512`. Matches `meta.embedding_model` and `meta.embedding_dimensions`.
 - `memory_vec.rowid = objects.id`. Never insert into `memory_vec` without a matching `objects` row first.
 - `index_docs.embedding_text_hash = sha256(embedding_text)`. The migration's verify phase checks hash integrity.
-- Raw layer (`chunks`, `sources`, `migration_log`, `extraction_cache`) is read-only for the skill.
+- Raw layer (`chunks`, `sources`, `migration_log`, `extraction_cache`) is owned by its pipelines: the `ingest-docs` command owns `sources`/`chunks`, the migration pipeline owns `migration_log`/`extraction_cache`. Hand-written SQL into the raw layer is forbidden; there is no manual write path.
 
 ## See also
 

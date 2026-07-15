@@ -3238,6 +3238,8 @@ def _ingest_classify_source(rel_posix: str, *, external: bool = False) -> Tuple[
         return "runtime_prompt", "policies"
     if rel_posix.startswith("docs/evidence/"):
         return "evidence", "project_doc"
+    if rel_posix.startswith("docs/knowledge/"):
+        return "thematic_doc", "project_doc"
     if rel_posix.startswith("docs/"):
         return "strategic_doc", "project_doc"
     if rel_posix.startswith(".agent/tasks/") and rel_posix.endswith("/spec.md"):
@@ -3430,6 +3432,114 @@ def _ingest_source_in_default_scope(source_path: str) -> bool:
         and parts[1] == "tasks"
         and candidate.name == "spec.md"
     )
+
+
+# Pathspecs limiting the git-state scan to the managed document corpus. The
+# actual membership test is _ingest_source_in_default_scope; these only bound
+# how much of the tree `git status` has to walk. `.agent/memory.db` is outside
+# every pathspec by construction, so the ingest-then-commit-the-DB cadence
+# never trips the gate.
+_MANAGED_GIT_PATHSPECS = ("docs", "AGENTS.md", ".agent/tasks")
+
+
+def _ingest_git_toplevel(repo_root: Path) -> Optional[Path]:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+        )
+        return Path(out.decode("utf-8", errors="replace").strip()).resolve()
+    except Exception:
+        return None
+
+
+def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
+    """Inspect the managed document corpus against Git for the commit boundary.
+
+    The document lifecycle indexes only committed bytes: the committed
+    memory.db must never reference document content other clones cannot
+    reproduce from HEAD. Returns:
+      git_available        — repo_root is the top level of a git work tree
+      git_reason           — why Git is unavailable (None when available)
+      dirty_managed_paths  — managed paths with uncommitted state relative to
+                             HEAD: modified, added, deleted, renamed (both
+                             sides checked), or untracked-and-not-ignored
+      ignored_managed_paths— untracked managed paths matched by .gitignore;
+                             they are outside the reproducible corpus and are
+                             excluded from selection, never silently indexed
+    Tracked files that merely match an ignore rule are reported by neither
+    list: Git keeps tracking them, so they stay in the corpus.
+    """
+    root = repo_root.resolve()
+    toplevel = _ingest_git_toplevel(root)
+    if toplevel is None:
+        return {
+            "git_available": False,
+            "git_reason": f"{root} is not inside a Git work tree",
+            "dirty_managed_paths": [],
+            "ignored_managed_paths": [],
+        }
+    if toplevel != root:
+        return {
+            "git_available": False,
+            "git_reason": (
+                f"target repo root {root} must be the Git top level "
+                f"(found {toplevel})"
+            ),
+            "dirty_managed_paths": [],
+            "ignored_managed_paths": [],
+        }
+    try:
+        raw = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(root),
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--",
+                *_MANAGED_GIT_PATHSPECS,
+            ],
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8", errors="replace")
+    except (subprocess.CalledProcessError, UnicodeDecodeError) as exc:
+        return {
+            "git_available": False,
+            "git_reason": f"cannot read git status in {root}: {exc}",
+            "dirty_managed_paths": [],
+            "ignored_managed_paths": [],
+        }
+
+    dirty: Set[str] = set()
+    ignored: Set[str] = set()
+    fields = raw.split("\0")
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status_xy = entry[:2]
+        paths = [entry[3:]]
+        if status_xy[0] in ("R", "C") and i < len(fields) and fields[i]:
+            paths.append(fields[i])
+            i += 1
+        for candidate in paths:
+            if not _ingest_source_in_default_scope(candidate):
+                continue
+            if status_xy == "!!":
+                ignored.add(candidate)
+            else:
+                dirty.add(candidate)
+    return {
+        "git_available": True,
+        "git_reason": None,
+        "dirty_managed_paths": sorted(dirty),
+        "ignored_managed_paths": sorted(ignored),
+    }
 
 
 def _ingest_expand_paths_arg(raw_paths: Sequence[str], repo_root: Path) -> List[Path]:
@@ -3742,12 +3852,47 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
     except ValueError as exc:
         die(str(exc), where="ingest-docs", code=2)
 
+    dry_run = bool(args.dry_run)
+    do_prune = not args.no_prune
+
+    git_gate: Optional[Dict[str, Any]] = None
+    if external_root is None:
+        git_gate = _ingest_managed_git_state(repo_root)
+        if not git_gate["git_available"]:
+            if not dry_run:
+                die(
+                    "ingest-docs indexes only committed documents and requires Git: "
+                    f"{git_gate['git_reason']}. Infrastructure bootstrap and typed-memory "
+                    "writes work without Git; use --dry-run for a non-committable preview.",
+                    where="ingest-docs",
+                    code=2,
+                )
+            log(f"warning: {git_gate['git_reason']}; dry-run preview only, committable=false")
+        else:
+            ignored_keys = set(git_gate["ignored_managed_paths"])
+            if ignored_keys:
+                kept: List[Path] = []
+                for path in selected:
+                    key = _ingest_source_key(path, repo_root, None)
+                    if key in ignored_keys:
+                        log(f"gitignored, outside the reproducible corpus, not indexed: {key}")
+                    else:
+                        kept.append(path)
+                selected = kept
+            if git_gate["dirty_managed_paths"] and not dry_run:
+                listing = ", ".join(git_gate["dirty_managed_paths"][:20])
+                if len(git_gate["dirty_managed_paths"]) > 20:
+                    listing += ", ..."
+                die(
+                    "managed document corpus is dirty relative to HEAD; commit or revert "
+                    f"before ingest-docs: {listing}",
+                    where="ingest-docs",
+                    code=2,
+                )
+
     selected_source_keys = {
         _ingest_source_key(path, repo_root, external_root) for path in selected
     }
-
-    dry_run = bool(args.dry_run)
-    do_prune = not args.no_prune
 
     conn = connect(expected_db, need_vec=True)
 
@@ -3756,6 +3901,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
         "files_new": 0,
         "files_changed": 0,
         "files_unchanged": 0,
+        "files_reclassified": 0,
         "files_pruned": 0,
         "chunks_added": 0,
         "chunks_reused": 0,
@@ -3767,15 +3913,74 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
     plan_new: List[Dict[str, Any]] = []
     plan_changed: List[Dict[str, Any]] = []
     plan_pruned: List[Dict[str, Any]] = []
+    plan_reclassified: List[Dict[str, Any]] = []
 
     for path in selected:
         rel_posix = _ingest_source_key(path, repo_root, external_root)
         text = path.read_text(encoding="utf-8", errors="replace")
         file_hash = sha256_text(text)
+        source_role, source_category = _ingest_classify_source(
+            rel_posix, external=external_root is not None
+        )
 
         existing = conn.execute(
-            "SELECT id, content_hash FROM sources WHERE path=?", (rel_posix,)
+            "SELECT id, content_hash, source_role, source_category FROM sources WHERE path=?",
+            (rel_posix,),
         ).fetchone()
+
+        if existing and (
+            str(existing[2]) != source_role or str(existing[3]) != source_category
+        ):
+            # Classification is derived state: refresh role/category even when
+            # the file bytes are unchanged, or a classifier upgrade strands old
+            # rows that verify-doc-index can never reconcile. Category is
+            # denormalized into index_docs.tags (FTS syncs via trigger);
+            # embedding text contains neither, so vectors stay untouched.
+            counters["files_reclassified"] += 1
+            if dry_run:
+                plan_reclassified.append(
+                    {
+                        "path": rel_posix,
+                        "from_role": str(existing[2]),
+                        "from_category": str(existing[3]),
+                        "to_role": source_role,
+                        "to_category": source_category,
+                    }
+                )
+                log(
+                    f"[dry-run] reclassify: {rel_posix} "
+                    f"({existing[2]}/{existing[3]} -> {source_role}/{source_category})"
+                )
+            else:
+                category_changed = str(existing[3]) != source_category
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "UPDATE sources SET source_role=?, source_category=? WHERE id=?",
+                        (source_role, source_category, int(existing[0])),
+                    )
+                    if category_changed:
+                        conn.execute(
+                            """
+                            UPDATE index_docs SET tags=?
+                            WHERE object_id IN (
+                                SELECT object_id FROM chunks
+                                WHERE source_id=? AND extraction_status='parsed_structural'
+                            )
+                            """,
+                            (
+                                _ingest_chunk_tags(rel_posix, source_category),
+                                int(existing[0]),
+                            ),
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                log(
+                    f"reclassified: {rel_posix} "
+                    f"({existing[2]}/{existing[3]} -> {source_role}/{source_category})"
+                )
 
         if existing and existing[1] == file_hash:
             counters["files_unchanged"] += 1
@@ -3784,9 +3989,6 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
 
         drafts = _ingest_build_chunk_drafts(text, path.stem)
         detected_date = _ingest_detect_date(path.name)
-        source_role, source_category = _ingest_classify_source(
-            rel_posix, external=external_root is not None
-        )
 
         if not existing:
             embedding_texts = [
@@ -3942,6 +4144,18 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
         "db": str(expected_db),
         "external_root": str(external_root) if external_root is not None else None,
         "external_revision": external_revision,
+        "git_available": git_gate["git_available"] if git_gate is not None else None,
+        "committable": (
+            bool(git_gate["git_available"] and not git_gate["dirty_managed_paths"])
+            if git_gate is not None
+            else None
+        ),
+        "dirty_managed_paths": (
+            git_gate["dirty_managed_paths"] if git_gate is not None else []
+        ),
+        "ignored_managed_paths": (
+            git_gate["ignored_managed_paths"] if git_gate is not None else []
+        ),
         **counters,
         "dry_run": dry_run,
     }
@@ -3949,143 +4163,18 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
         result["plan_new"] = plan_new
         result["plan_changed"] = plan_changed
         result["plan_pruned"] = plan_pruned
+        result["plan_reclassified"] = plan_reclassified
     json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
 
 
-def _verify_doc_index(
+def _verify_active_projections(
     conn: sqlite3.Connection,
-    expected_source_paths: Sequence[str],
-    *,
-    expected_source_hashes: Optional[Dict[str, str]] = None,
-    external_root: Optional[Path] = None,
-    repo_root: Optional[Path] = None,
+    source_by_path: Dict[str, Dict[str, Any]],
+    source_ids: Sequence[int],
 ) -> Dict[str, Any]:
-    """Verify document content and every active search projection end to end."""
-    expected = sorted(set(str(path) for path in expected_source_paths))
-    empty_diagnostics = {
-        "unexpected_sources": [],
-        "source_role_mismatches": [],
-        "source_category_mismatches": [],
-        "source_hash_mismatches": [],
-        "chunk_hash_mismatches": [],
-    }
-    if not expected:
-        return {
-            "ok": False,
-            "expected_sources": 0,
-            "indexed_sources": 0,
-            "active_chunks": 0,
-            "source_paths": [],
-            "missing_sources": [],
-            "sources_without_active_chunks": [],
-            "missing_index_docs": [],
-            "missing_fts": [],
-            "missing_vectors": [],
-            "missing_embedding_meta": [],
-            "embedding_hash_mismatches": [],
-            "embedding_contract_mismatches": [],
-            **empty_diagnostics,
-        }
-
-    path_placeholders = ",".join("?" * len(expected))
-    source_rows = conn.execute(
-        f"""
-        SELECT id, path, source_role, source_category, content_hash
-        FROM sources
-        WHERE path IN ({path_placeholders})
-        ORDER BY path
-        """,
-        expected,
-    ).fetchall()
-    source_by_path = {
-        str(path): {
-            "id": int(source_id),
-            "source_role": str(source_role),
-            "source_category": str(source_category),
-            "content_hash": str(content_hash),
-        }
-        for source_id, path, source_role, source_category, content_hash in source_rows
-    }
-    source_paths = sorted(source_by_path)
-    missing_sources = sorted(set(expected) - set(source_by_path))
-    source_ids = [int(row["id"]) for row in source_by_path.values()]
-
-    unexpected_sources: List[str] = []
-    source_role_mismatches: List[str] = []
-    source_category_mismatches: List[str] = []
-    if external_root is not None:
-        root = external_root.resolve()
-        scoped_paths = {
-            str(path)
-            for (path,) in conn.execute("SELECT path FROM sources").fetchall()
-            if Path(str(path)).is_absolute()
-            and _ingest_is_within_repo(Path(str(path)).resolve(), root)
-        }
-        unexpected_sources = sorted(scoped_paths - set(expected))
-        source_role_mismatches = sorted(
-            path
-            for path, row in source_by_path.items()
-            if row["source_role"] != "external_memory_archive"
-        )
-        source_category_mismatches = sorted(
-            path
-            for path, row in source_by_path.items()
-            if row["source_category"] != "other"
-        )
-    elif repo_root is not None:
-        scoped_paths = {
-            str(path)
-            for (path,) in conn.execute("SELECT path FROM sources").fetchall()
-            if _ingest_source_in_default_scope(str(path))
-        }
-        unexpected_sources = sorted(scoped_paths - set(expected))
-        expected_roles = {
-            path: _ingest_classify_source(path)
-            for path in expected
-            if _ingest_source_in_default_scope(path)
-        }
-        source_role_mismatches = sorted(
-            path
-            for path, (expected_role, _expected_category) in expected_roles.items()
-            if path in source_by_path
-            and source_by_path[path]["source_role"] != expected_role
-        )
-        source_category_mismatches = sorted(
-            path
-            for path, (_expected_role, expected_category) in expected_roles.items()
-            if path in source_by_path
-            and source_by_path[path]["source_category"] != expected_category
-        )
-
-    source_hash_mismatches = sorted(
-        path
-        for path, expected_hash in (expected_source_hashes or {}).items()
-        if path in source_by_path and source_by_path[path]["content_hash"] != expected_hash
-    )
-
-    if not source_ids:
-        return {
-            "ok": False,
-            "expected_sources": len(expected),
-            "indexed_sources": 0,
-            "active_chunks": 0,
-            "source_paths": [],
-            "missing_sources": missing_sources,
-            "sources_without_active_chunks": [],
-            "missing_index_docs": [],
-            "missing_fts": [],
-            "missing_vectors": [],
-            "missing_embedding_meta": [],
-            "embedding_hash_mismatches": [],
-            "embedding_contract_mismatches": [],
-            "unexpected_sources": unexpected_sources,
-            "source_role_mismatches": source_role_mismatches,
-            "source_category_mismatches": source_category_mismatches,
-            "source_hash_mismatches": source_hash_mismatches,
-            "chunk_hash_mismatches": [],
-        }
-
+    """Prove chunk/FTS/vector/embedding coverage for a non-empty source set."""
+    source_ids = list(source_ids)
     source_placeholders = ",".join("?" * len(source_ids))
     active_rows = conn.execute(
         f"""
@@ -4182,33 +4271,8 @@ def _verify_doc_index(
             [*source_ids, MODEL, DIMENSIONS],
         ).fetchall()
     ]
-
-    failures = (
-        missing_sources
-        or unexpected_sources
-        or source_role_mismatches
-        or source_category_mismatches
-        or source_hash_mismatches
-        or sources_without_active_chunks
-        or missing_index_docs
-        or missing_fts
-        or missing_vectors
-        or missing_embedding_meta
-        or chunk_hash_mismatches
-        or embedding_hash_mismatches
-        or embedding_contract_mismatches
-    )
     return {
-        "ok": not bool(failures),
-        "expected_sources": len(expected),
-        "indexed_sources": len(source_paths),
-        "active_chunks": len(active_ids),
-        "source_paths": source_paths,
-        "missing_sources": missing_sources,
-        "unexpected_sources": unexpected_sources,
-        "source_role_mismatches": source_role_mismatches,
-        "source_category_mismatches": source_category_mismatches,
-        "source_hash_mismatches": source_hash_mismatches,
+        "active_ids": active_ids,
         "sources_without_active_chunks": sources_without_active_chunks,
         "missing_index_docs": missing_index_docs,
         "missing_fts": missing_fts,
@@ -4220,21 +4284,244 @@ def _verify_doc_index(
     }
 
 
+def _verify_doc_index(
+    conn: sqlite3.Connection,
+    expected_source_paths: Sequence[str],
+    *,
+    expected_source_hashes: Optional[Dict[str, str]] = None,
+    external_root: Optional[Path] = None,
+    repo_root: Optional[Path] = None,
+    dirty_managed_paths: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Verify document content and every active search projection end to end.
+
+    An empty expected corpus is a healthy state, not a failure: zero expected
+    documents with zero leftover in-scope sources returns ok=true with
+    corpus_empty=true. A source whose file left the corpus but whose chunks
+    are pinned as evidence is a legitimate tombstone only when every chunk is
+    genuinely referenced, has extraction_status='ignored', and carries no
+    index_docs/FTS/vector/embedding-meta projection; such sources are listed
+    in retained_evidence_sources instead of failing the check, while any
+    active, partially indexed, or unjustified leftover still fails it.
+    dirty_managed_paths (uncommitted managed files, supplied by the caller)
+    is its own failure category, kept separate from stale-source reporting.
+    """
+    expected = sorted(set(str(path) for path in expected_source_paths))
+    corpus_empty = not expected
+    dirty = sorted(set(str(path) for path in (dirty_managed_paths or [])))
+
+    source_by_path: Dict[str, Dict[str, Any]] = {}
+    if expected:
+        path_placeholders = ",".join("?" * len(expected))
+        source_rows = conn.execute(
+            f"""
+            SELECT id, path, source_role, source_category, content_hash
+            FROM sources
+            WHERE path IN ({path_placeholders})
+            ORDER BY path
+            """,
+            expected,
+        ).fetchall()
+        source_by_path = {
+            str(path): {
+                "id": int(source_id),
+                "source_role": str(source_role),
+                "source_category": str(source_category),
+                "content_hash": str(content_hash),
+            }
+            for source_id, path, source_role, source_category, content_hash in source_rows
+        }
+    source_paths = sorted(source_by_path)
+    missing_sources = sorted(set(expected) - set(source_by_path))
+    source_ids = [int(row["id"]) for row in source_by_path.values()]
+
+    scoped_paths: Set[str] = set()
+    source_role_mismatches: List[str] = []
+    source_category_mismatches: List[str] = []
+    if external_root is not None:
+        root = external_root.resolve()
+        scoped_paths = {
+            str(path)
+            for (path,) in conn.execute("SELECT path FROM sources").fetchall()
+            if Path(str(path)).is_absolute()
+            and _ingest_is_within_repo(Path(str(path)).resolve(), root)
+        }
+        source_role_mismatches = sorted(
+            path
+            for path, row in source_by_path.items()
+            if row["source_role"] != "external_memory_archive"
+        )
+        source_category_mismatches = sorted(
+            path
+            for path, row in source_by_path.items()
+            if row["source_category"] != "other"
+        )
+    elif repo_root is not None:
+        scoped_paths = {
+            str(path)
+            for (path,) in conn.execute("SELECT path FROM sources").fetchall()
+            if _ingest_source_in_default_scope(str(path))
+        }
+        expected_roles = {
+            path: _ingest_classify_source(path)
+            for path in expected
+            if _ingest_source_in_default_scope(path)
+        }
+        source_role_mismatches = sorted(
+            path
+            for path, (expected_role, _expected_category) in expected_roles.items()
+            if path in source_by_path
+            and source_by_path[path]["source_role"] != expected_role
+        )
+        source_category_mismatches = sorted(
+            path
+            for path, (_expected_role, expected_category) in expected_roles.items()
+            if path in source_by_path
+            and source_by_path[path]["source_category"] != expected_category
+        )
+
+    unexpected_sources: List[str] = []
+    retained_evidence_sources: List[str] = []
+    retained_evidence_chunks: List[int] = []
+    invalid_evidence_tombstones: List[str] = []
+    for leftover_path in sorted(scoped_paths - set(expected)):
+        row = conn.execute(
+            "SELECT id FROM sources WHERE path=?", (leftover_path,)
+        ).fetchone()
+        if row is None:
+            continue
+        chunk_rows = conn.execute(
+            """
+            SELECT id, object_id, extraction_status
+            FROM chunks WHERE source_id=? ORDER BY object_id
+            """,
+            (int(row[0]),),
+        ).fetchall()
+        if not chunk_rows or any(
+            str(status) != "ignored" for _row_id, _object_id, status in chunk_rows
+        ):
+            unexpected_sources.append(leftover_path)
+            continue
+        object_ids = [int(object_id) for _row_id, object_id, _status in chunk_rows]
+        tombstone_ok = True
+        for object_id in object_ids:
+            if not _ingest_is_chunk_referenced(conn, object_id):
+                tombstone_ok = False
+                break
+            projected = conn.execute(
+                """
+                SELECT
+                  EXISTS(SELECT 1 FROM index_docs WHERE object_id=?),
+                  EXISTS(SELECT 1 FROM memory_fts WHERE rowid=?),
+                  EXISTS(SELECT 1 FROM memory_vec WHERE rowid=?),
+                  EXISTS(SELECT 1 FROM embedding_meta WHERE object_id=?)
+                """,
+                (object_id, object_id, object_id, object_id),
+            ).fetchone()
+            if any(bool(flag) for flag in projected):
+                tombstone_ok = False
+                break
+        if tombstone_ok:
+            retained_evidence_sources.append(leftover_path)
+            retained_evidence_chunks.extend(object_ids)
+        else:
+            invalid_evidence_tombstones.append(leftover_path)
+
+    source_hash_mismatches = sorted(
+        path
+        for path, expected_hash in (expected_source_hashes or {}).items()
+        if path in source_by_path and source_by_path[path]["content_hash"] != expected_hash
+    )
+
+    projections: Dict[str, Any] = {
+        "active_ids": [],
+        "sources_without_active_chunks": [],
+        "missing_index_docs": [],
+        "missing_fts": [],
+        "missing_vectors": [],
+        "missing_embedding_meta": [],
+        "chunk_hash_mismatches": [],
+        "embedding_hash_mismatches": [],
+        "embedding_contract_mismatches": [],
+    }
+    if source_ids:
+        projections = _verify_active_projections(conn, source_by_path, source_ids)
+
+    failures = (
+        missing_sources
+        or unexpected_sources
+        or invalid_evidence_tombstones
+        or source_role_mismatches
+        or source_category_mismatches
+        or source_hash_mismatches
+        or projections["sources_without_active_chunks"]
+        or projections["missing_index_docs"]
+        or projections["missing_fts"]
+        or projections["missing_vectors"]
+        or projections["missing_embedding_meta"]
+        or projections["chunk_hash_mismatches"]
+        or projections["embedding_hash_mismatches"]
+        or projections["embedding_contract_mismatches"]
+        or dirty
+    )
+    return {
+        "ok": not bool(failures),
+        "corpus_empty": corpus_empty,
+        "expected_sources": len(expected),
+        "indexed_sources": len(source_paths),
+        "active_chunks": len(projections["active_ids"]),
+        "source_paths": source_paths,
+        "missing_sources": missing_sources,
+        "unexpected_sources": unexpected_sources,
+        "retained_evidence_sources": retained_evidence_sources,
+        "retained_evidence_chunks": retained_evidence_chunks,
+        "invalid_evidence_tombstones": invalid_evidence_tombstones,
+        "dirty_managed_paths": dirty,
+        "source_role_mismatches": source_role_mismatches,
+        "source_category_mismatches": source_category_mismatches,
+        "source_hash_mismatches": source_hash_mismatches,
+        "sources_without_active_chunks": projections["sources_without_active_chunks"],
+        "missing_index_docs": projections["missing_index_docs"],
+        "missing_fts": projections["missing_fts"],
+        "missing_vectors": projections["missing_vectors"],
+        "missing_embedding_meta": projections["missing_embedding_meta"],
+        "chunk_hash_mismatches": projections["chunk_hash_mismatches"],
+        "embedding_hash_mismatches": projections["embedding_hash_mismatches"],
+        "embedding_contract_mismatches": projections["embedding_contract_mismatches"],
+    }
+
+
 def cmd_verify_doc_index(args: argparse.Namespace) -> None:
     repo_root = target_repo_root()
     db_path = resolve_db_path()
     external_root = (
         Path(args.external_root).expanduser().resolve() if args.external_root else None
     )
+    git_gate: Optional[Dict[str, Any]] = None
     try:
         external_revision: Optional[str] = None
         if external_root is not None:
             external_revision = _ingest_external_revision(external_root)
             selected = _ingest_external_tracked_markdown(external_root)
         else:
+            git_gate = _ingest_managed_git_state(repo_root)
+            if not git_gate["git_available"]:
+                die(
+                    "verify-doc-index proves the index against the committed corpus "
+                    f"and requires Git: {git_gate['git_reason']}",
+                    where="verify-doc-index",
+                    code=2,
+                )
             selected = _ingest_apply_excludes_sort_dedupe(
                 _ingest_default_selection(repo_root), repo_root
             )
+            ignored_keys = set(git_gate["ignored_managed_paths"])
+            if ignored_keys:
+                selected = [
+                    path
+                    for path in selected
+                    if _ingest_source_key(path, repo_root, None) not in ignored_keys
+                ]
         expected_paths = [
             _ingest_source_key(path, repo_root, external_root) for path in selected
         ]
@@ -4254,6 +4541,9 @@ def cmd_verify_doc_index(args: argparse.Namespace) -> None:
         expected_source_hashes=expected_source_hashes,
         external_root=external_root,
         repo_root=repo_root if external_root is None else None,
+        dirty_managed_paths=(
+            git_gate["dirty_managed_paths"] if git_gate is not None else None
+        ),
     )
     recorded_external_revision = (
         _read_external_archive_revision(conn, external_root)
@@ -4274,6 +4564,9 @@ def cmd_verify_doc_index(args: argparse.Namespace) -> None:
             "external_revision": external_revision,
             "recorded_external_revision": recorded_external_revision,
             "external_revision_matches": external_revision_matches,
+            "ignored_managed_paths": (
+                git_gate["ignored_managed_paths"] if git_gate is not None else []
+            ),
         }
     )
     json.dump(result, sys.stdout, ensure_ascii=False)
@@ -4518,7 +4811,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     idoc = sub.add_parser(
         "ingest-docs",
-        help="Chunk + incrementally sync committed markdown docs into sources/chunks/index_docs/memory_vec",
+        help=(
+            "Chunk + incrementally sync committed markdown docs into "
+            "sources/chunks/index_docs/memory_vec (requires Git and a clean "
+            "managed corpus; --dry-run previews without either)"
+        ),
     )
     idoc.add_argument(
         "--paths",
@@ -4540,7 +4837,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     vdoc = sub.add_parser(
         "verify-doc-index",
-        help="Verify document source/chunk/FTS/vector/embedding coverage",
+        help=(
+            "Verify document source/chunk/FTS/vector/embedding coverage against "
+            "the committed corpus (requires Git; an empty corpus verifies ok "
+            "with corpus_empty=true)"
+        ),
     )
     vdoc.add_argument(
         "--external-root",

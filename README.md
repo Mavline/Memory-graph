@@ -30,12 +30,29 @@ Initialize repo-local memory in this project using
 https://github.com/Mavline/Memory-graph.
 
 Follow project-memory-structure-instruction.md. Copy the memgraph/ kit into the
-project root, set up AGENTS.md and CLAUDE.md, create .agent/memory.db, configure
-startup context for Claude and Codex, verify session-context and recall, and
-commit only the intended portable files. Keep .env, memgraph/venv/,
-memgraph/vendor/, archives, backups, and generated scratch files out of git.
-Make it work on macOS/Linux and Windows.
+project root, set up AGENTS.md and CLAUDE.md, create the EMPTY .agent/memory.db
+(bootstrap touches no documents and writes no test records), configure startup
+context for Claude and Codex, verify session-context, and commit only the
+intended portable files. Keep .env, memgraph/venv/, memgraph/vendor/, archives,
+backups, and generated scratch files out of git. Make it work on macOS/Linux
+and Windows.
 ```
+
+Quick Start stands up the empty memory infrastructure only: no documents are
+required to exist, nothing is indexed, and an empty memory is a healthy state.
+What happens next depends on the project:
+
+- **New project** — documents are indexed as they appear. After every commit
+  that creates, updates, moves, or deletes a managed document (`docs/**/*.md`,
+  `AGENTS.md`, `.agent/tasks/**/spec.md`), run `memgraph/memgraph ingest-docs`
+  and `memgraph/memgraph verify-doc-index`, then commit the updated
+  `.agent/memory.db`. Typed memory (decisions, claims, tasks) is written only
+  when real events happen; no smoke records are ever written.
+- **Existing repository** — run a one-time backfill: inventory the committed
+  document corpus, run `ingest-docs` once, prove full coverage with
+  `verify-doc-index`, spot-check semantic recall against a known document, and
+  re-run `ingest-docs` to prove idempotency (a no-op). From then on the project
+  follows the per-commit document lifecycle above.
 
 Manual reference: place `memgraph/` at the root of the target project.
 

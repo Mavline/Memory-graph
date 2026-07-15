@@ -27,11 +27,14 @@ escape hatch to a shared/global DB: when supplied, it must still resolve to
 
 ## 0. Prerequisites
 
-Python 3 and Git. On Windows, built-in Windows PowerShell 5.1
-(`powershell.exe`) is enough; PowerShell 7 (`pwsh`) is optional. Use the
-python.org Python build — it has loadable sqlite-extension support that the
-Microsoft Store / some pyenv builds lack. Internet to PyPI + OpenAI. Run the
-commands below from inside this `memgraph/` folder unless noted.
+Python 3 and Git. Git is required by the document lifecycle (`ingest-docs` /
+`verify-doc-index` index only committed bytes); infrastructure bootstrap and
+typed-memory writes work before a Git repo exists. On Windows, built-in
+Windows PowerShell 5.1 (`powershell.exe`) is enough; PowerShell 7 (`pwsh`) is
+optional. Use the python.org Python build — it has loadable sqlite-extension
+support that the Microsoft Store / some pyenv builds lack. Internet to PyPI +
+OpenAI. Run the commands below from inside this `memgraph/` folder unless
+noted.
 
 ## 1. venv + dependencies  (per machine, gitignored)
 
@@ -86,6 +89,10 @@ run from there). It applies the canonical schema (24 tables + FTS5 +
 sqlite-vec@512) into `<repo>/.agent/memory.db`. Refuses to clobber an existing
 DB unless you pass `--force` (which backs up the old one first).
 
+Bootstrap creates only the empty store. It does not create, look for, or index
+any documents — a project with no `docs/` yet is a valid target, and the empty
+memory is a healthy state.
+
 ## 5. Agent startup integration  (repo-local, so it travels)
 
 Shared rule for every agent:
@@ -115,11 +122,28 @@ runtime rule.
 
 ## 6. Verify  (through the wrapper — never scripts/*.py directly)
 
+Infrastructure verification — works with an empty memory and no documents.
 macOS / Linux (run from the project root):
 
     memgraph/memgraph session-context                        # pure SQL, no key
-    memgraph/memgraph recall "<paraphrase of a known fact>"  # needs key; must report "vector_leg": true
-    memgraph/memgraph write-claim --type observation --statement "kit live" --confidence 0.9
+    memgraph/memgraph recall "<any phrase>"                  # needs key; must report "vector_leg": true
+
+Zero recall hits on an empty memory is the healthy result, not a failure. Do
+NOT write smoke/test records (such as a "kit live" claim) to prove the kit
+works: typed memory is written only by real project events, and the empty
+state is valid.
+
+Document-index verification — only when the project has committed managed
+documents (`docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`):
+
+    memgraph/memgraph ingest-docs
+    memgraph/memgraph verify-doc-index
+
+Both require Git and a clean managed corpus (uncommitted managed documents are
+an error; `ingest-docs --dry-run` previews drafts and reports
+`committable=false`). On a project with no documents `verify-doc-index`
+reports `ok: true` with `corpus_empty: true` — the expected empty-corpus
+result.
 
 Windows: same commands via:
 

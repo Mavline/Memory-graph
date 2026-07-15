@@ -17,6 +17,9 @@ markdown/json файлов, никаких параллельных «памят
    этапов и дорожную карту. Канонический документ один — `docs/spec.md`.
    Дополнительных стратегических документов может быть сколько нужно, но
    каждый подчиняется правилам раздела «Стратегические документы».
+   Тематические рабочие документы агентов (выводы, поиски, исследования)
+   живут в утверждённом один раз канале `docs/knowledge/` — см. тот же
+   раздел.
 2. `.agent/memory.db` — живая процессная память через `memgraph`: задачи,
    статусы, доказательства, блокеры, решения, gotchas, review verdicts,
    события workflow и embedding/FTS-поиск.
@@ -158,6 +161,39 @@ markdown/json файлов, никаких параллельных «памят
 Если процессный факт стал устойчивым правилом, его повышают из memgraph в
 стратегический документ или в `AGENTS.md` намеренно, отдельным коммитом.
 
+### Тематические рабочие документы (`docs/knowledge/`)
+
+Помимо стратегических документов проекту разрешён один канал тематических
+рабочих документов — `docs/knowledge/**/*.md`: выводы, результаты поисков,
+исследования, технические разборы и накопленные знания, которые агент ведёт
+сам. Канал утверждается один раз — принятием этой инструкции; отдельное
+утверждение каждого файла не требуется, и ссылка из `docs/spec.md` не
+обязательна. Индексируются эти файлы тем же жизненным циклом документов, что и
+остальные `docs/**` (см. «Индексация документов»): роль источника —
+`thematic_doc`, полный вес авторитетности `1.0` в recall.
+
+Правила каждого тематического файла:
+
+- одна устойчивая тема на файл; темы не пересекаются между файлами;
+- содержательные Markdown-заголовки — они же границы фрагментов индекса;
+- фиксируются выводы, основания, источники и оставшиеся неизвестные;
+- ссылки на файлы проекта — только относительные от корня репозитория;
+- файл — курируемое текущее знание. В отличие от стратегических документов
+  правило «только дописывание» здесь не действует: устаревший вывод не должен
+  конкурировать в поиске с актуальным. Историю правок хранит Git, а значимые
+  опровержения фиксируются типизированными записями (`write-claim`,
+  `write-decision`).
+
+Запрещено в тематических файлах: статусы задач, handoff и прогресс; сырые логи
+и транскрипты; временные рабочие заметки; неподтверждённые выводы,
+сформулированные как принятые решения.
+
+Тематический документ не переопределяет стратегию, policy или decision, а его
+фрагмент в результатах recall — поисковый указатель на источник, не
+подтверждённый факт. Повышение знания всегда явное: тематический документ,
+затем проверка, затем `write-claim` или `write-decision`, затем — при
+необходимости — изменение `docs/spec.md` или планового документа.
+
 ## Что значит «помнить всё»
 
 Помнить всё не значит складывать сырые логи в проект. Каноническую память
@@ -185,7 +221,7 @@ markdown/json файлов, никаких параллельных «памят
 
 Если проект по явному решению владельца коммитит доказательства и досье в
 `docs/` (auditable-режим), их содержимое включается в поиск командой
-`ingest-docs` (см. раздел «Индексация утверждённых документов»), а не
+`ingest-docs` (см. раздел «Индексация документов»), а не
 дублируется в типизированных записях: указатель-вердикт остаётся краткой
 записью, полный текст ищется как фрагменты документа.
 
@@ -199,6 +235,7 @@ markdown/json файлов, никаких параллельных «памят
 ├── CLAUDE.md                       # ровно одна строка: @AGENTS.md
 ├── docs/
 │   ├── spec.md                     # обязательный канонический документ
+│   ├── knowledge/                  # тематические рабочие документы агентов (канал утверждён один раз)
 │   └── <дополнительные>.md         # сколько нужно; каждый утверждён и связан из spec.md
 ├── .agent/
 │   ├── memory.db                   # процессная память (memgraph)
@@ -276,8 +313,11 @@ context. Working context and operational memory go to `.agent/memory.db`
 through `memgraph`. Durable product decisions are consolidated into the
 canonical source document `docs/spec.md`, unless the user explicitly approves a
 separate source document; an approved separate document must be linked from
-`docs/spec.md` with a one-line reason. Otherwise consolidate or delete the
-sidecar before commit.
+`docs/spec.md` with a one-line reason. The one standing exception is the
+thematic-knowledge channel `docs/knowledge/**/*.md`: curated topical findings,
+research results, and investigation write-ups may be created there without
+per-file approval, under the thematic rules in STRATEGIC-DOCUMENT DISCIPLINE.
+Otherwise consolidate or delete the sidecar before commit.
 
 MEMORY WRITE CADENCE: write to `.agent/memory.db` through `memgraph` DURING the
 work, not as a closing summary. Each time, citing concrete evidence (file path,
@@ -290,10 +330,20 @@ self-review, or closeout; and on every `wf-status` transition. A turn that
 produced a finding, a verdict, or a pivot but wrote nothing to memgraph is
 incomplete; deferring all writes to the end is a violation. `recall` is hybrid
 (semantic + keyword) — query by meaning, and never treat a keyword miss as proof
-that nothing was recorded. After committing new or revised strategic/evidence
-documents (appended sections included), run `memgraph ingest-docs` in the same
-turn and commit the updated `.agent/memory.db`; a committed document whose
-content is absent from the index is an unfinished tail.
+that nothing was recorded.
+
+DOCUMENT INDEX LIFECYCLE: every create, update, move, or delete of a managed
+document (`docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`) finishes in
+the same work unit as: commit the document, run `memgraph ingest-docs`, run
+`memgraph verify-doc-index`, then commit the updated `.agent/memory.db` and
+push both commits. A committed document whose content is absent from the index
+is an unfinished tail. The engine enforces the commit boundary: production
+ingest/verify require Git and a clean managed corpus, while `--dry-run`
+previews drafts and reports `committable=false`; untracked gitignored files
+are never indexed and are listed as `ignored_managed_paths`. An empty corpus
+is a healthy state — `verify-doc-index` reports ok with `corpus_empty=true` —
+and sources retained only as fully de-indexed evidence tombstones are listed
+separately in `retained_evidence_sources`.
 
 STRATEGIC-DOCUMENT DISCIPLINE: durable system knowledge is split across the
 approved strategic documents, never dumped into one rolling file. `docs/spec.md`
@@ -303,7 +353,12 @@ exist is mandatory. Never delete or overwrite a past finding to tidy up: mark an
 overturned fact in place `[SUPERSEDED <UTC date>: why]`, send the displaced
 reasoning to memgraph, and append a one-line dated entry to the document's
 revision log. A decomposition or plan document is a living deliverable, updated
-the same turn a node is resolved — not a write-once file.
+the same turn a node is resolved — not a write-once file. Thematic knowledge
+files under `docs/knowledge/` are the one channel outside this append-only
+rule: keep each as curated current knowledge on a single stable topic (history
+lives in Git; overturned findings become typed claims/decisions), never as
+task status, handoffs, raw logs, or scratch notes, and never as a place that
+overrides strategy, policies, or decisions.
 
 ## Startup Discipline
 
@@ -556,21 +611,44 @@ failure cases; требуемые тесты и проверки; evidence, ко
 ревьюера); `orchestration_event` (assignment, checkpoint, blocker, completion,
 handoff).
 
-### Индексация утверждённых документов (`ingest-docs`)
+### Индексация документов (`ingest-docs`) и их жизненный цикл
 
-Закоммиченные стратегические документы и доказательства — это источники, а не
-процессная память. Чтобы `recall` находил их содержимое по смыслу, комплект
-содержит команду `memgraph/memgraph ingest-docs`: она нарезает Markdown по
-заголовкам на смысловые фрагменты и кладёт их в сырой слой той же
-`.agent/memory.db` (`sources` + `chunks`) с проекцией в FTS и векторный индекс.
+Закоммиченные документы проекта — это источники, а не процессная память. Чтобы
+`recall` находил их содержимое по смыслу, комплект содержит команду
+`memgraph/memgraph ingest-docs`: она нарезает Markdown по заголовкам на
+смысловые фрагменты (длинные секции дробятся по границам абзацев) и кладёт их в
+сырой слой той же `.agent/memory.db` (`sources` + `chunks`) с проекцией в FTS
+и векторный индекс.
+
+Жизненный цикл: любое событие над управляемым документом — создан, изменён,
+перемещён, удалён — завершается в том же рабочем блоке цепочкой «коммит
+документа, `ingest-docs`, `verify-doc-index`, коммит обновлённой
+`.agent/memory.db`, push обоих коммитов». Закоммиченный документ, содержимого
+которого нет в индексе, — незакрытый хвост.
 
 Правила:
 
 - охват по умолчанию: `docs/**`, `AGENTS.md`, замороженные
   `.agent/tasks/**/spec.md`; `CLAUDE.md` и `memgraph/**` не индексируются;
+- классификация источников: `AGENTS.md` получает роль `runtime_prompt`,
+  `docs/evidence/` — `evidence`, `docs/knowledge/` — `thematic_doc`
+  (тематические рабочие документы, полный вес авторитетности `1.0`), остальные
+  `docs/` — `strategic_doc`, `.agent/tasks/**/spec.md` — `task_spec`.
+  Классификация — производное состояние: при изменении правил она освежается
+  даже у неизменённых файлов, без переэмбеддинга (смена категории переписывает
+  только теги фрагментов);
+- граница коммита: боевой запуск `ingest-docs` и `verify-doc-index` требует
+  Git и чистого управляемого корпуса относительно `HEAD` — включая
+  неотслеживаемые, удалённые и переименованные файлы; `--dry-run` работает на
+  черновиках и без Git, но возвращает `committable=false`. Неотслеживаемые
+  файлы под правилами `.gitignore` не индексируются и перечисляются в
+  `ignored_managed_paths`; уже отслеживаемый файл остаётся в корпусе, даже
+  если позднее попал под правило игнорирования;
 - обновление инкрементально: файл с неизменным хешем пропускается, неизменные
   секции переиспользуются без переэмбеддинга, устаревшие фрагменты удаляются,
-  а использованные как evidence — сохраняются, но выводятся из индекса;
+  а использованные как evidence — сохраняются, но полностью выводятся из
+  индекса (надгробие для аудита: без строк в `index_docs`, FTS, векторном
+  индексе и метаданных эмбеддинга);
 - фрагменты не становятся типизированными записями автоматически: решения и
   клеймы по-прежнему пишутся вручную после проверки;
 - одна память на репозиторий: **все** команды отказываются работать, когда
@@ -598,9 +676,18 @@ handoff).
   по смыслу актуальное доказательство проекта ранжировалось выше старого
   внешнего архива;
 - без `--external-root` тот же verifier проверяет текущий default-набор
-  документов репозитория и падает при оставшихся в индексе stale-источниках;
-- запускать после коммита новых или изменённых документов; прогон без
-  изменений — no-op.
+  документов репозитория. Пустой корпус — исправное состояние: `ok: true` с
+  признаком `corpus_empty: true`. Оставшийся активный, частично
+  проиндексированный или бесхозный управляемый источник — провал с
+  перечислением в `unexpected_sources`. Корректные надгробия evidence
+  (каждый фрагмент реально используется как доказательство, имеет статус
+  `ignored` и полностью выведен из поисковых проекций) перечисляются отдельно
+  в `retained_evidence_sources` и `retained_evidence_chunks` и проверку не
+  валят; надгробие с оставшейся проекцией или без реальной ссылки — провал.
+  Грязный управляемый корпус выводится отдельным полем `dirty_managed_paths`,
+  а не выдаётся за stale-источник;
+- запускать по жизненному циклу выше — после коммита созданного, изменённого,
+  перемещённого или удалённого документа; прогон без изменений — no-op.
 
 ## Переносимость между машинами
 
@@ -686,41 +773,82 @@ evidence-файлы под `.agent/tasks/**`; папки сырого вывод
 задач как нормальный workflow; продуктовые правила из другого репозитория;
 старые процессные файлы, вытесненные memgraph.
 
-## Bootstrap checklist
+## Bootstrap и четыре независимых процесса
+
+Поднятие и ведение памяти состоит из четырёх независимых процессов. У каждого
+свой триггер и своё определение «готово»; смешивать их нельзя.
+
+### A. Инфраструктура памяти (пустая база)
 
 Для нового проекта:
 
 1. Создать `AGENTS.md` из шаблона выше; заменить имена стратегических
    документов в `Source Hierarchy` и `Startup Discipline` под проект.
 2. Создать `CLAUDE.md` с единственной строкой `@AGENTS.md`.
-3. Создать канонический `docs/spec.md`.
-4. Создать дополнительные стратегические документы, только если они нужны и
-   утверждены; связать их из `docs/spec.md`.
-5. Добавить `.env` и селективные правила `.agent/` в `.gitignore`: игнорировать
+3. Добавить `.env` и селективные правила `.agent/` в `.gitignore`: игнорировать
    сгенерированный мусор `.agent`, но оставить отслеживаемыми `.agent/memory.db`
    и `.agent/tasks/<TASK_ID>/spec.md`.
-6. Развернуть скилл `memgraph` (уже установленный в окружении или приложенный
+4. Развернуть скилл `memgraph` (уже установленный в окружении или приложенный
    `./memgraph/` — см. «Memgraph: установка и использование»); не копировать
    движок по файлам вручную.
-7. Создать `.agent/memory.db` вызовом bootstrap скилла; он применяет
-   каноническую схему (24 таблицы + FTS5 + sqlite-vec@512):
+5. Создать `.agent/memory.db` вызовом bootstrap скилла; он применяет
+   каноническую схему (24 таблицы + FTS5 + sqlite-vec@512) и не трогает никакие
+   файлы проекта:
    - macOS/Linux: `memgraph/venv/bin/python memgraph/scripts/bootstrap.py --target <repo>`
    - Windows: `memgraph\venv\Scripts\python.exe memgraph\scripts\bootstrap.py --target <repo>`
-8. Добавить `OPENAI_API_KEY` в локальный `.env`; задокументировать в
+6. Добавить `OPENAI_API_KEY` в локальный `.env`; задокументировать в
    `.env.example`.
-9. Выполнить `memgraph/memgraph session-context` на macOS/Linux или
+7. Выполнить `memgraph/memgraph session-context` на macOS/Linux или
    `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context` на Windows.
-10. Записать начальные policy/decision проекта через memgraph.
-11. Закоммитить bootstrap-файлы, включая `.agent/memory.db` и любые
-    замороженные `.agent/tasks/<TASK_ID>/spec.md`, исключая `.env` и
-    запрещённые артефакты `.agent`.
-12. Проверить подачу: открыть свежую Claude или Codex-сессию в репозитории и
-    убедиться, что `session-context` доступен. Если нет — чинить команду
-    startup-интеграции, путь или политику оболочки, пока не сработает.
-13. Проверить вознаграждение: `memgraph/memgraph recall "<запрос-парафраз>"`
-    (или Windows `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 recall "<запрос-парафраз>"`) должен
-    вернуть релевантные записи по смыслу (с включённым векторным плечом), а не
-    пустоту. Это доказательство, что память будут использовать, а не игнорировать.
+8. Проверить подачу: открыть свежую Claude или Codex-сессию в репозитории и
+   убедиться, что `session-context` доступен. Если нет — чинить команду
+   startup-интеграции, путь или политику оболочки, пока не сработает.
+9. Закоммитить bootstrap-файлы, включая пустую `.agent/memory.db`, исключая
+   `.env` и запрещённые артефакты `.agent`.
+
+Отсутствие документов — допустимое состояние этого процесса. Bootstrap не
+создаёт, не ищет и не индексирует документы; `docs/spec.md` не является
+предусловием пустой базы; `verify-doc-index` на пустом корпусе обязан
+возвращать исправность с признаком `corpus_empty: true`. Никакие тестовые
+записи (вроде «kit live») в базу не пишутся.
+
+### B. Типизированная память
+
+Заполняется только реальными событиями по MEMORY WRITE CADENCE: policies,
+decisions, claims, задачи и события — каждая запись вызвана настоящим фактом
+работы и цитирует доказательство. Пустая типизированная память нового проекта —
+норма, а не дефект. Проверка «вознаграждения» (см. «Почему память не
+используется сама собой») выполняется, когда появилась первая настоящая
+запись: `memgraph/memgraph recall "<запрос-парафраз>"` (Windows:
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 recall "<запрос-парафраз>"`)
+должен вернуть её по смыслу, с включённым векторным плечом, а не пустоту.
+
+### C. Жизненный цикл документов
+
+`docs/spec.md` обязателен перед продуктовой реализацией — но не перед
+созданием пустой базы. Дополнительные стратегические документы создаются
+только утверждёнными и связанными из `docs/spec.md`; тематические рабочие
+документы (`docs/knowledge/`) агент создаёт без поштучного утверждения. Как
+только управляемый документ создан, изменён, перемещён или удалён, в том же
+рабочем блоке выполняется цепочка из раздела «Индексация документов»: коммит
+документа, `ingest-docs`, `verify-doc-index`, коммит обновлённой
+`.agent/memory.db`, push обоих коммитов.
+
+### D. Подключение к существующему репозиторию (разовое обратное заполнение)
+
+Только для проекта, где документы накопились до появления памяти:
+
+1. Инвентаризация корпуса: перечислить управляемые документы и убедиться, что
+   они закоммичены.
+2. Полный `ingest-docs`.
+3. `verify-doc-index`: охват N из N, без пропусков, лишних источников и
+   несовпадающих хешей.
+4. Проверка семантического поиска: `recall` парафразом находит фрагмент
+   известного документа с корректными `source_path` и `source_role`.
+5. Повторный `ingest-docs` — доказательство идемпотентности: no-op без новых
+   эмбеддингов.
+
+После обратного заполнения проект живёт по процессу C.
 
 После bootstrap каждая задача идёт по одному циклу: прочитать источники,
 вспомнить память, заморозить спецификацию, реализовать, проверить, отревьюить,

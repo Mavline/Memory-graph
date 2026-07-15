@@ -28,6 +28,28 @@ Repo-local long-term memory lives in `<repo>/.agent/memory.db`. It unifies the l
 
 Embedding provider is OpenAI `text-embedding-3-small` reduced to 512 dims (fixed in `meta` table). sqlite-vec `0.1.6` is the pinned loadable extension.
 
+## Four independent processes
+
+The kit runs four processes that must not be conflated:
+
+1. **Infrastructure bootstrap** — `bootstrap.py` creates only the empty
+   `.agent/memory.db` (schema + FTS + vector runtime); startup integration is
+   wired per `install/README.md`. Documents are not required, nothing is
+   indexed, and Git is not needed yet. An empty memory is a healthy state.
+2. **Typed memory writes** — `write-*` commands record real policies,
+   decisions, claims, tasks, and events as they happen. Never write smoke or
+   test records (no "kit live" claims); an empty typed memory is valid.
+3. **Document index lifecycle** — every create/update/move/delete of a managed
+   document finishes in the same work unit: commit the document, run
+   `ingest-docs`, run `verify-doc-index`, commit the updated
+   `.agent/memory.db`, push both commits. Production runs require Git and a
+   clean managed corpus.
+4. **Existing-repository backfill** — a one-time adoption procedure for a repo
+   that already has documents: inventory the committed corpus, run a full
+   `ingest-docs`, prove N-of-N coverage with `verify-doc-index`, spot-check
+   semantic recall, rerun `ingest-docs` to prove idempotency (a no-op).
+   Afterwards the project lives by process 3.
+
 ## Entrypoint
 
 The only supported entrypoint is the wrapper next to this file. Put this folder
@@ -59,6 +81,10 @@ schema (24 tables + FTS5 + sqlite-vec@512) before any read/write:
 Run once per project (`--force` overwrites, backing up the old DB first).
 `bootstrap.py` only creates the store — it does NOT set up the venv, the `.env`
 key, or agent startup integration; see `install/README.md` for the full stand-up.
+It also does NOT create, look for, or index any documents: a project with no
+`docs/` yet is a valid target, and `verify-doc-index` on that empty corpus
+reports `ok: true` with `corpus_empty: true`. Do not write test records to
+prove the store works.
 
 ## Hard constraints (exceptions only)
 
@@ -168,14 +194,37 @@ document CONTENT retrievable by hybrid recall alongside typed records.
 
 - Default scope: `docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`;
   `CLAUDE.md` and `memgraph/**` are always excluded.
-- Chunking is structural: ATX-heading sections with a size cap; the heading
-  breadcrumb lands in `chunks.heading_path`;
-  `extraction_status='parsed_structural'`.
+- Source classification: `AGENTS.md` gets `source_role='runtime_prompt'`,
+  `docs/evidence/**` gets `evidence`, `docs/knowledge/**` gets `thematic_doc`
+  (agent-curated topical knowledge; full `1.0` recall authority),
+  the rest of `docs/**` gets `strategic_doc`, `.agent/tasks/**/spec.md` gets
+  `task_spec`. Classification is derived state: ingest refreshes role/category
+  even for unchanged files without re-embedding (a category change rewrites
+  only the chunks' `index_docs.tags`; the FTS trigger syncs).
+- Commit boundary: production `ingest-docs`/`verify-doc-index` require Git and
+  a clean managed corpus relative to HEAD — modified, deleted, renamed, and
+  untracked non-ignored managed files all block the run. `--dry-run` previews
+  drafts (and works without Git) but reports `committable=false`. Untracked
+  managed files matched by `.gitignore` are never indexed and are listed as
+  `ignored_managed_paths`; a tracked file stays in the corpus even if an
+  ignore rule later matches it.
+- Lifecycle: run the chain on every create/update/move/delete of a managed
+  document, in the same work unit — commit the document, `ingest-docs`,
+  `verify-doc-index`, commit the updated `.agent/memory.db`, push both
+  commits.
+- Chunking is structural: ATX-heading sections with a size cap (long sections
+  split on paragraph boundaries); the heading breadcrumb lands in
+  `chunks.heading_path`; `extraction_status='parsed_structural'`.
 - Incremental: unchanged files are skipped by content hash; unchanged sections
   are reused without re-embedding; stale chunks are deleted — unless referenced
-  as evidence, then kept but de-indexed (`extraction_status='ignored'`).
+  as evidence, then kept but fully de-indexed
+  (`extraction_status='ignored'`, no `index_docs`/FTS/vector/embedding-meta
+  rows: an auditable tombstone).
 - Chunks are sources, not knowledge: ingest never auto-creates claims or
-  decisions. Typed records are still written manually after verification.
+  decisions. Typed records are still written manually after verification. A
+  `thematic_doc` chunk is a search pointer into the document, never an
+  approved decision; promotion is explicit (verify, then
+  `write-claim`/`write-decision`).
 - One memory per repo: every command dies when `MEMGRAPH_DB` points outside
   `<repo>/.agent/memory.db`. Normal `--paths` refuses files outside the target
   repository.
@@ -196,11 +245,18 @@ document CONTENT retrievable by hybrid recall alongside typed records.
   authority weight;
   their unmodified semantic score remains available as `raw_score`.
 - Without `--external-root`, the verifier applies the same freshness/projection
-  checks to the default repo document scope and fails on stale managed sources.
-- Run it after committing new or revised strategic/evidence documents, or when
-  recall misses content that is known to be committed. A no-change rerun is a
-  no-op. Embedding is batched (`embed.py --batch`); a 40-file corpus costs on
-  the order of $0.005.
+  checks to the default repo document scope. Contract: an empty corpus is
+  healthy (`ok: true`, `corpus_empty: true`); any leftover active, partially
+  indexed, or unjustified managed source fails with its path in
+  `unexpected_sources`; valid evidence tombstones (every chunk genuinely
+  referenced, `ignored`, and fully de-indexed) are listed separately in
+  `retained_evidence_sources`/`retained_evidence_chunks` and do not fail;
+  an uncommitted managed corpus fails with its own `dirty_managed_paths` key,
+  never disguised as a stale source.
+- Run it per the document lifecycle above (after committing a created,
+  updated, moved, or deleted document), or when recall misses content that is
+  known to be committed. A no-change rerun is a no-op. Embedding is batched
+  (`embed.py --batch`); a 40-file corpus costs on the order of $0.005.
 - Recall results now include `chunk` hits — document sections whose
   `title`/`aliases` carry the source file path. Treat a chunk hit as a pointer
   into the committed document, not as a typed fact.
@@ -216,7 +272,10 @@ document CONTENT retrievable by hybrid recall alongside typed records.
   and the same `5 × --k` candidate limit.
 - Fusion: `raw_score = Σ 1/(60 + rank_i)` across both legs, grouped by
   `object_id`; external-memory archive chunks then use
-  `score = raw_score × 0.75`, while project and typed records keep weight `1.0`.
+  `score = raw_score × 0.75`, while project and typed records — including
+  `thematic_doc` chunks — keep weight `1.0` (search score reflects relevance;
+  normative status is carried by `source_role` and explicit promotion to typed
+  records, not by ranking penalties).
 - Final projection: `object_type`, `title`, full `summary`, `score`,
   `raw_score`, `authority_weight`, and provenance/structured-row pointers.
 - Objects targeted by an active `invalidates` or `supersedes` edge are hidden
