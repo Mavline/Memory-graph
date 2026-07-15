@@ -215,9 +215,12 @@ document CONTENT retrievable by hybrid recall alongside typed records.
   target bytes, so a managed path that is or crosses a symlink (even a clean
   tracked one) is never indexed — source identity is the lexical repo path,
   never a resolved target. Ingest and verify list such paths as
-  `symlinked_managed_paths`; a symlink given explicitly to `--paths` is an
-  error. The same rule filters tracked symlinks out of external-archive
-  imports.
+  `symlinked_managed_paths` (a symlinked directory is listed once, as the
+  directory path); a symlink given explicitly to `--paths` is an error. The
+  same rule filters tracked symlinks out of external-archive imports. Stored
+  source keys keep their namespace lexically too: they are never resolved
+  against the live disk, so a file later replaced by an outward symlink is
+  still pruned and still fails verification instead of escaping both.
 - Lifecycle: run the chain on every create/update/move/delete of a managed
   document, in the same work unit — commit the document, `ingest-docs`,
   `verify-doc-index`, commit the updated `.agent/memory.db`, push both

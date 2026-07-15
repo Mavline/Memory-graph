@@ -3411,15 +3411,28 @@ def _ingest_source_in_scope(
     repo_root: Path,
     external_root: Optional[Path],
 ) -> bool:
-    """Keep pruning isolated to the selected repo or external archive namespace."""
+    """Keep pruning isolated to the selected repo or external archive namespace.
+
+    Membership is LEXICAL: the stored key already names the namespace it was
+    ingested into. Never consult the disk (resolve/realpath) here — a source
+    whose file was later replaced by an outward symlink would "leave" its own
+    namespace and dodge pruning and verification at exactly the moment it has
+    to be cleaned up."""
     candidate = Path(source_path)
     if external_root is not None:
         if not candidate.is_absolute():
             return False
-        return _ingest_is_within_repo(candidate.resolve(), external_root.resolve())
+        normalized = Path(os.path.normpath(str(candidate)))
+        # Both spellings of the root: keys are minted from the resolved root
+        # at ingest time, but the root argument may arrive unresolved (e.g.
+        # /tmp vs /private/tmp on macOS). Only the root — the caller's own
+        # live argument — is ever resolved; stored keys never are.
+        scope_roots = {external_root.resolve(), Path(os.path.normpath(str(external_root)))}
+        return any(_ingest_is_within_repo(normalized, root) for root in scope_roots)
     if candidate.is_absolute():
         return False
-    return _ingest_is_within_repo((repo_root / candidate).resolve(), repo_root.resolve())
+    normalized = Path(os.path.normpath(source_path))
+    return not normalized.is_absolute() and normalized.parts[:1] != ("..",)
 
 
 def _ingest_source_in_default_scope(source_path: str) -> bool:
@@ -3643,6 +3656,27 @@ def _ingest_default_selection(repo_root: Path) -> List[Path]:
     if tasks_dir.is_dir():
         candidates.extend(tasks_dir.rglob("spec.md"))
     return candidates
+
+
+def _ingest_symlinked_managed_dirs(repo_root: Path) -> List[str]:
+    """Symlinked directories inside the managed roots. File selection never
+    descends into them (and must not), so they produce no per-file candidates;
+    report the directory itself to keep symlinked_managed_paths an honest
+    inventory of every managed path excluded by the symlink rule."""
+    found: Set[str] = set()
+    for base in ("docs", ".agent/tasks"):
+        base_dir = repo_root / base
+        if base_dir.is_symlink():
+            found.add(base)
+            continue
+        if not base_dir.is_dir():
+            continue
+        for dirpath, dirnames, _filenames in os.walk(base_dir, followlinks=False):
+            for name in dirnames:
+                child = Path(dirpath) / name
+                if child.is_symlink():
+                    found.add(child.relative_to(repo_root).as_posix())
+    return sorted(found)
 
 
 def _ingest_apply_excludes_sort_dedupe(
@@ -3926,8 +3960,11 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
                 raw_candidates = _ingest_expand_paths_arg(args.paths, repo_root)
             else:
                 raw_candidates = _ingest_default_selection(repo_root)
-            selected, symlinked_managed_paths = _ingest_apply_excludes_sort_dedupe(
+            selected, symlinked_files = _ingest_apply_excludes_sort_dedupe(
                 raw_candidates, repo_root
+            )
+            symlinked_managed_paths = sorted(
+                set(symlinked_files) | set(_ingest_symlinked_managed_dirs(repo_root))
             )
             for key in symlinked_managed_paths:
                 log(f"symlink, outside the reproducible corpus, not indexed: {key}")
@@ -4498,11 +4535,20 @@ def _verify_doc_index(
     source_category_mismatches: List[str] = []
     if external_root is not None:
         root = external_root.resolve()
+        # Lexical membership, like _ingest_source_in_scope: resolving stored
+        # keys against the current disk would hide a source whose file was
+        # since replaced by an outward symlink — the exact stale source this
+        # audit exists to catch. Only the live root argument is resolved, and
+        # both its spellings (as given and resolved) count.
+        scope_roots = {root, Path(os.path.normpath(str(external_root)))}
         scoped_paths = {
             str(path)
             for (path,) in conn.execute("SELECT path FROM sources").fetchall()
             if Path(str(path)).is_absolute()
-            and _ingest_is_within_repo(Path(str(path)).resolve(), root)
+            and any(
+                _ingest_is_within_repo(Path(os.path.normpath(str(path))), scope_root)
+                for scope_root in scope_roots
+            )
         }
         source_role_mismatches = sorted(
             path
@@ -4686,8 +4732,11 @@ def cmd_verify_doc_index(args: argparse.Namespace) -> None:
                     where="verify-doc-index",
                     code=2,
                 )
-            selected, symlinked_managed_paths = _ingest_apply_excludes_sort_dedupe(
+            selected, symlinked_files = _ingest_apply_excludes_sort_dedupe(
                 _ingest_default_selection(repo_root), repo_root
+            )
+            symlinked_managed_paths = sorted(
+                set(symlinked_files) | set(_ingest_symlinked_managed_dirs(repo_root))
             )
             ignored_keys = set(git_gate["ignored_managed_paths"])
             if ignored_keys:

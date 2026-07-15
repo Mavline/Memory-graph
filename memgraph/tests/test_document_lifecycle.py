@@ -790,13 +790,15 @@ class EndToEndLifecycleTests(unittest.TestCase):
         self.assertNotIn(".agent/tasks/WF-9/spec.md", self._sources())
         self.assertIn("AGENTS.md", self._sources())
 
-    def _symlink(self, rel: str, target: str) -> None:
-        link = self.repo / rel
+    def _symlink_at(self, link: Path, target: str) -> None:
         link.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.symlink(target, link)
         except OSError as exc:  # e.g. Windows without symlink privilege
             self.skipTest(f"cannot create symlinks here: {exc}")
+
+    def _symlink(self, rel: str, target: str) -> None:
+        self._symlink_at(self.repo / rel, target)
 
     def test_ignored_symlink_to_untracked_target_is_not_indexed(self) -> None:
         # An ignored symlink must not smuggle its (uncommitted) target into the
@@ -849,7 +851,9 @@ class EndToEndLifecycleTests(unittest.TestCase):
 
     def test_symlinked_directory_component_is_not_indexed(self) -> None:
         # A symlinked directory inside the managed tree must not leak the
-        # target directory's files into the corpus under either name.
+        # target directory's files into the corpus under either name, and the
+        # directory itself must be listed: file selection never descends into
+        # it, so no per-file candidate would otherwise report the exclusion.
         _git(self.repo, "init", "-q")
         self._write("docs/spec.md", "# Spec\n\nBody.\n")
         self._commit_all()
@@ -857,12 +861,103 @@ class EndToEndLifecycleTests(unittest.TestCase):
         self._symlink("docs/knowledge", "../private")
 
         ingest = self._run_cli("ingest-docs")
+        verify = self._run_cli("verify-doc-index")
 
         self.assertTrue(ingest["ok"])
+        self.assertEqual(ingest["symlinked_managed_paths"], ["docs/knowledge"])
         sources = self._sources()
         self.assertNotIn("docs/knowledge/x.md", sources)
         self.assertNotIn("private/x.md", sources)
         self.assertEqual(sorted(sources), ["docs/spec.md"])
+        self.assertTrue(verify["ok"])
+        self.assertEqual(verify["symlinked_managed_paths"], ["docs/knowledge"])
+
+    def test_file_replaced_by_outward_symlink_is_pruned_everywhere(self) -> None:
+        # Transition: a committed, indexed regular file later becomes a
+        # tracked symlink pointing outside the corpus. The stored source key
+        # must keep belonging to its namespace LEXICALLY, so prune removes it
+        # and a pre-prune verify fails it — resolving against the current disk
+        # would let the stale chunk keep serving deleted text via recall.
+        _git(self.repo, "init", "-q")
+        self._write("docs/topic.md", "# Topic\n\nOld searchable token ALPHA-STALE.\n")
+        self._commit_all()
+        self._run_cli("ingest-docs")
+        self.assertIn("docs/topic.md", self._sources())
+
+        (self.repo / "docs/topic.md").unlink()
+        self._write("private/secret.md", "# New\n\nUncommitted target.\n")
+        self._symlink("docs/topic.md", "../private/secret.md")
+        _git(self.repo, "add", "docs")
+        _git(self.repo, "commit", "-qm", "replace file with symlink")
+
+        stale_verify, code = self._run_cli_expect_exit("verify-doc-index")
+        self.assertEqual(code, 1)
+        self.assertEqual(stale_verify["unexpected_sources"], ["docs/topic.md"])
+
+        ingest = self._run_cli("ingest-docs")
+        verify = self._run_cli("verify-doc-index")
+
+        self.assertTrue(ingest["ok"])
+        self.assertEqual(ingest["files_pruned"], 1)
+        self.assertEqual(ingest["symlinked_managed_paths"], ["docs/topic.md"])
+        self.assertNotIn("docs/topic.md", self._sources())
+        self.assertEqual(
+            self._db().execute("SELECT COUNT(*) FROM index_docs").fetchone()[0], 0
+        )
+        self.assertTrue(verify["ok"])
+        self.assertTrue(verify["corpus_empty"])
+
+    def test_external_file_replaced_by_outward_symlink_is_pruned_and_flagged(self) -> None:
+        # Transition in an external archive: a tracked, indexed regular file
+        # later becomes a tracked symlink pointing outside the archive. The
+        # stored absolute key must keep belonging to the archive namespace
+        # lexically: verify must flag the stale source even when the archive
+        # revision matches, and prune must remove it.
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        base = Path(td.name).resolve()
+        archive = base / "archive"
+        outside = base / "outside"
+        archive.mkdir()
+        outside.mkdir()
+        (outside / "secret.md").write_text(
+            "# Outside\n\nUncommitted bytes.\n", encoding="utf-8"
+        )
+        _git(archive, "init", "-q")
+        (archive / "leak.md").write_text(
+            "# Leak\n\nOld searchable token ALPHA-STALE.\n", encoding="utf-8"
+        )
+        (archive / "keep.md").write_text("# Keep\n\nStays tracked.\n", encoding="utf-8")
+        _git(archive, "add", "-A")
+        _git(archive, "commit", "-qm", "archive fixture")
+
+        first = self._run_cli("ingest-docs", "--external-root", str(archive))
+        leak_key = str(archive / "leak.md")
+        self.assertTrue(first["ok"])
+        self.assertIn(leak_key, self._sources())
+
+        (archive / "leak.md").unlink()
+        self._symlink_at(archive / "leak.md", str(outside / "secret.md"))
+        _git(archive, "add", "-A")
+        _git(archive, "commit", "-qm", "replace file with outward symlink")
+
+        # Defence in depth: even if pruning is skipped, verify must fail the
+        # stale source — with the recorded revision already matching the new
+        # HEAD, exactly the state that used to verify ok.
+        self._run_cli("ingest-docs", "--external-root", str(archive), "--no-prune")
+        stale, code = self._run_cli_expect_exit(
+            "verify-doc-index", "--external-root", str(archive)
+        )
+        self.assertEqual(code, 1)
+        self.assertTrue(stale["external_revision_matches"])
+        self.assertIn(leak_key, stale["unexpected_sources"])
+
+        cleanup = self._run_cli("ingest-docs", "--external-root", str(archive))
+        verify = self._run_cli("verify-doc-index", "--external-root", str(archive))
+
+        self.assertEqual(cleanup["files_pruned"], 1)
+        self.assertNotIn(leak_key, self._sources())
+        self.assertTrue(verify["ok"])
 
     def test_paths_outside_managed_corpus_dies(self) -> None:
         # --paths narrows the managed selection; it must never widen the
