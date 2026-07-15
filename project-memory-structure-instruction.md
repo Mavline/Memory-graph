@@ -340,7 +340,9 @@ push both commits. A committed document whose content is absent from the index
 is an unfinished tail. The engine enforces the commit boundary: production
 ingest/verify require Git and a clean managed corpus, while `--dry-run`
 previews drafts and reports `committable=false`; untracked gitignored files
-are never indexed and are listed as `ignored_managed_paths`. An empty corpus
+are never indexed and are listed as `ignored_managed_paths`; paths that are or
+cross a symlink are never indexed (Git commits the link, not the target bytes)
+and are listed as `symlinked_managed_paths`. An empty corpus
 is a healthy state — `verify-doc-index` reports ok with `corpus_empty=true` —
 and sources retained only as fully de-indexed evidence tombstones are listed
 separately in `retained_evidence_sources`.
@@ -644,6 +646,12 @@ handoff).
   файлы под правилами `.gitignore` не индексируются и перечисляются в
   `ignored_managed_paths`; уже отслеживаемый файл остаётся в корпусе, даже
   если позднее попал под правило игнорирования;
+- символические ссылки — вне воспроизводимого корпуса: Git коммитит саму
+  ссылку, а не байты цели, поэтому управляемый путь, который является ссылкой
+  или проходит через неё (даже чистой и отслеживаемой), никогда не
+  индексируется. Идентичность источника — буквальный путь в репозитории,
+  никогда не развёрнутая цель ссылки; такие пути перечисляются в
+  `symlinked_managed_paths`;
 - обновление инкрементально: файл с неизменным хешем пропускается, неизменные
   секции переиспользуются без переэмбеддинга, устаревшие фрагменты удаляются,
   а использованные как evidence — сохраняются, но полностью выводятся из
@@ -653,7 +661,11 @@ handoff).
   клеймы по-прежнему пишутся вручную после проверки;
 - одна память на репозиторий: **все** команды отказываются работать, когда
   `MEMGRAPH_DB` указывает за пределы `<repo>/.agent/memory.db`; обычный
-  `--paths` не читает файлы вне репозитория;
+  `--paths` только сужает управляемый набор и никогда его не расширяет —
+  явный файл вне управляемой области (или вне репозитория) — это ошибка,
+  каталог разворачивается только в свои управляемые `**/*.md`. Граница
+  коммита и верификатор покрывают ровно управляемую область, поэтому обойти
+  их через выбор путей нельзя;
 - явное исключение по приказу владельца — разовый импорт внешнего Git-архива:
   `memgraph/memgraph ingest-docs --external-root <archive-git-root>` берёт ровно
   его tracked `*.md`, сохраняет абсолютный путь как provenance-ссылку и кладёт
@@ -684,8 +696,12 @@ handoff).
   `ignored` и полностью выведен из поисковых проекций) перечисляются отдельно
   в `retained_evidence_sources` и `retained_evidence_chunks` и проверку не
   валят; надгробие с оставшейся проекцией или без реальной ссылки — провал.
-  Грязный управляемый корпус выводится отдельным полем `dirty_managed_paths`,
-  а не выдаётся за stale-источник;
+  Аудит охватывает каждый репозиторный источник в базе, а не только пути
+  управляемой области: источник вне этой области никогда не попадал в корпус
+  законно и проваливает проверку как `unexpected_sources` независимо от
+  состояния его фрагментов — снисхождение для надгробий на него не
+  распространяется. Грязный управляемый корпус выводится отдельным полем
+  `dirty_managed_paths`, а не выдаётся за stale-источник;
 - запускать по жизненному циклу выше — после коммита созданного, изменённого,
   перемещённого или удалённого документа; прогон без изменений — no-op.
 

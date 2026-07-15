@@ -73,6 +73,40 @@ class ExternalMemoryArchiveSelectionTests(unittest.TestCase):
                 ["MEMORY.md", "nested/rollout.md"],
             )
 
+    def test_external_tracked_symlink_to_untracked_target_is_excluded(self) -> None:
+        # The archive commit stores the link, not the target bytes, so a
+        # tracked symlink's content is not reproducible from the archive HEAD.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._tracked_markdown_repo(root)
+            (root / "private.md").write_text("# Uncommitted\n", encoding="utf-8")
+            try:
+                os.symlink("private.md", root / "leak.md")
+            except OSError as exc:
+                self.skipTest(f"cannot create symlinks here: {exc}")
+            subprocess.run(["git", "add", "leak.md"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Memgraph Test",
+                    "-c",
+                    "user.email=memgraph-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "tracked symlink",
+                ],
+                cwd=root,
+                check=True,
+            )
+
+            selected = MEMGRAPH._ingest_external_tracked_markdown(root)
+
+            self.assertEqual(
+                [p.relative_to(root.resolve()).as_posix() for p in selected],
+                ["MEMORY.md", "nested/rollout.md"],
+            )
+
     def test_external_revision_rejects_dirty_tracked_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -211,6 +211,13 @@ document CONTENT retrievable by hybrid recall alongside typed records.
   managed files matched by `.gitignore` are never indexed and are listed as
   `ignored_managed_paths`; a tracked file stays in the corpus even if an
   ignore rule later matches it.
+- Symlinks are outside the reproducible corpus: Git commits the link, not the
+  target bytes, so a managed path that is or crosses a symlink (even a clean
+  tracked one) is never indexed — source identity is the lexical repo path,
+  never a resolved target. Ingest and verify list such paths as
+  `symlinked_managed_paths`; a symlink given explicitly to `--paths` is an
+  error. The same rule filters tracked symlinks out of external-archive
+  imports.
 - Lifecycle: run the chain on every create/update/move/delete of a managed
   document, in the same work unit — commit the document, `ingest-docs`,
   `verify-doc-index`, commit the updated `.agent/memory.db`, push both
@@ -229,8 +236,11 @@ document CONTENT retrievable by hybrid recall alongside typed records.
   approved decision; promotion is explicit (verify, then
   `write-claim`/`write-decision`).
 - One memory per repo: every command dies when `MEMGRAPH_DB` points outside
-  `<repo>/.agent/memory.db`. Normal `--paths` refuses files outside the target
-  repository.
+  `<repo>/.agent/memory.db`. Normal `--paths` narrows the managed selection
+  and never widens it: an explicit file outside the managed corpus (or outside
+  the repo) is an error, and a directory expands only to its managed
+  `**/*.md`. The Git commit boundary and the verifier cover exactly the
+  managed corpus, so nothing ingestable can bypass them.
 - Explicit owner-approved archive exception: `--external-root <git-root>`
   imports exactly that archive's git-tracked `*.md` files into the target
   repository's same DB. Source keys are absolute paths, `source_role` is
@@ -255,7 +265,10 @@ document CONTENT retrievable by hybrid recall alongside typed records.
   referenced, `ignored`, and fully de-indexed) are listed separately in
   `retained_evidence_sources`/`retained_evidence_chunks` and do not fail;
   an uncommitted managed corpus fails with its own `dirty_managed_paths` key,
-  never disguised as a stale source.
+  never disguised as a stale source. The audit covers every repo-relative
+  source in the DB, not only managed paths: a repo source outside the managed
+  corpus fails as unexpected regardless of its chunk state — no tombstone
+  leniency.
 - Run it per the document lifecycle above (after committing a created,
   updated, moved, or deleted document), or when recall misses content that is
   known to be committed. A no-change rerun is a no-op. Embedding is batched

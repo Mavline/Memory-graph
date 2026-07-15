@@ -289,6 +289,38 @@ class VerifierContractTests(unittest.TestCase):
         self.assertEqual(result["unexpected_sources"], ["docs/knowledge/mixed.md"])
         self.assertEqual(result["retained_evidence_sources"], [])
 
+    def test_out_of_scope_repo_source_is_rejected(self) -> None:
+        # A repo-relative source outside the managed corpus (smuggled in by an
+        # old permissive --paths or a resolved symlink) must fail verification,
+        # not fall outside the audited scope.
+        conn = self._connection()
+        self._add_active_source(conn, 1, "docs/knowledge/topic.md", 42)
+        self._add_active_source(conn, 2, "private/uncommitted.md", 43)
+
+        result = MEMGRAPH._verify_doc_index(
+            conn,
+            ["docs/knowledge/topic.md"],
+            expected_source_hashes={"docs/knowledge/topic.md": "file-hash"},
+            repo_root=self.REPO_ROOT,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["unexpected_sources"], ["private/uncommitted.md"])
+
+    def test_out_of_scope_tombstone_gets_no_leniency(self) -> None:
+        # Evidence-tombstone retention exists for previously managed documents.
+        # A tombstone-shaped source outside the managed corpus is still an
+        # unexpected source, never a retained one.
+        conn = self._connection()
+        self._add_tombstone_source(conn, 1, "private/old.md", 42)
+
+        result = MEMGRAPH._verify_doc_index(conn, [], repo_root=self.REPO_ROOT)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["unexpected_sources"], ["private/old.md"])
+        self.assertEqual(result["retained_evidence_sources"], [])
+        self.assertEqual(result["invalid_evidence_tombstones"], [])
+
     def _add_section_tombstone(
         self,
         conn: sqlite3.Connection,
@@ -757,6 +789,112 @@ class EndToEndLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn(".agent/tasks/WF-9/spec.md", self._sources())
         self.assertIn("AGENTS.md", self._sources())
+
+    def _symlink(self, rel: str, target: str) -> None:
+        link = self.repo / rel
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(target, link)
+        except OSError as exc:  # e.g. Windows without symlink privilege
+            self.skipTest(f"cannot create symlinks here: {exc}")
+
+    def test_ignored_symlink_to_untracked_target_is_not_indexed(self) -> None:
+        # An ignored symlink must not smuggle its (uncommitted) target into the
+        # corpus under the target's resolved name.
+        _git(self.repo, "init", "-q")
+        self._write(".gitignore", "docs/knowledge/\n")
+        self._write("docs/spec.md", "# Spec\n\nBody.\n")
+        self._commit_all()
+        self._write("private/uncommitted.md", "# Leak\n\nSecret.\n")
+        self._symlink("docs/knowledge/leak.md", "../../private/uncommitted.md")
+
+        ingest = self._run_cli("ingest-docs")
+        verify = self._run_cli("verify-doc-index")
+
+        self.assertTrue(ingest["ok"])
+        self.assertTrue(ingest["committable"])
+        self.assertEqual(
+            ingest["symlinked_managed_paths"], ["docs/knowledge/leak.md"]
+        )
+        self.assertNotIn("private/uncommitted.md", self._sources())
+        self.assertNotIn("docs/knowledge/leak.md", self._sources())
+        self.assertIn("docs/spec.md", self._sources())
+        self.assertTrue(verify["ok"])
+        self.assertEqual(
+            verify["symlinked_managed_paths"], ["docs/knowledge/leak.md"]
+        )
+
+    def test_tracked_symlink_to_untracked_target_is_not_indexed(self) -> None:
+        # Git commits the link itself, not the target bytes: a clean tracked
+        # symlink still must not put its untracked target's content into the
+        # committed memory.db.
+        _git(self.repo, "init", "-q")
+        self._write("docs/spec.md", "# Spec\n\nBody.\n")
+        self._write("private/uncommitted.md", "# Leak\n\nSecret.\n")
+        self._symlink("docs/link.md", "../private/uncommitted.md")
+        _git(self.repo, "add", "docs")
+        _git(self.repo, "commit", "-qm", "tracked symlink")
+
+        ingest = self._run_cli("ingest-docs")
+        verify = self._run_cli("verify-doc-index")
+
+        self.assertTrue(ingest["ok"])
+        self.assertTrue(ingest["committable"])
+        self.assertEqual(ingest["symlinked_managed_paths"], ["docs/link.md"])
+        self.assertNotIn("private/uncommitted.md", self._sources())
+        self.assertNotIn("docs/link.md", self._sources())
+        self.assertIn("docs/spec.md", self._sources())
+        self.assertTrue(verify["ok"])
+        self.assertEqual(verify["symlinked_managed_paths"], ["docs/link.md"])
+
+    def test_symlinked_directory_component_is_not_indexed(self) -> None:
+        # A symlinked directory inside the managed tree must not leak the
+        # target directory's files into the corpus under either name.
+        _git(self.repo, "init", "-q")
+        self._write("docs/spec.md", "# Spec\n\nBody.\n")
+        self._commit_all()
+        self._write("private/x.md", "# Leak\n\nSecret.\n")
+        self._symlink("docs/knowledge", "../private")
+
+        ingest = self._run_cli("ingest-docs")
+
+        self.assertTrue(ingest["ok"])
+        sources = self._sources()
+        self.assertNotIn("docs/knowledge/x.md", sources)
+        self.assertNotIn("private/x.md", sources)
+        self.assertEqual(sorted(sources), ["docs/spec.md"])
+
+    def test_paths_outside_managed_corpus_dies(self) -> None:
+        # --paths narrows the managed selection; it must never widen the
+        # corpus past the Git gate's and the verifier's managed scope.
+        _git(self.repo, "init", "-q")
+        self._write("docs/spec.md", "# Spec\n\nBody.\n")
+        self._write("README.md", "# Readme\n\nCommitted but unmanaged.\n")
+        self._commit_all()
+        self._write("private/uncommitted.md", "# Leak\n\nSecret.\n")
+
+        for entry in ("private/uncommitted.md", "README.md"):
+            payload, code = self._run_cli_expect_exit(
+                "ingest-docs", "--paths", str(self.repo / entry), "--no-prune"
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("outside the managed document corpus", payload["error"])
+        self.assertEqual(self._sources(), {})
+
+    def test_paths_symlink_entry_dies(self) -> None:
+        _git(self.repo, "init", "-q")
+        self._write("docs/spec.md", "# Spec\n\nBody.\n")
+        self._commit_all()
+        self._write("private/uncommitted.md", "# Leak\n\nSecret.\n")
+        self._symlink("docs/link.md", "../private/uncommitted.md")
+
+        payload, code = self._run_cli_expect_exit(
+            "ingest-docs", "--paths", str(self.repo / "docs/link.md"), "--no-prune"
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("symlink", payload["error"])
+        self.assertEqual(self._sources(), {})
 
     def test_removed_section_leaves_tombstone_and_stale_projection_fails(self) -> None:
         _git(self.repo, "init", "-q")

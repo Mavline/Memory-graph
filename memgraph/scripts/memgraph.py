@@ -3289,10 +3289,16 @@ def _ingest_external_tracked_markdown(external_root: Path) -> List[Path]:
     except (subprocess.CalledProcessError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot enumerate tracked Markdown in {root}: {exc}") from exc
 
+    real_root = Path(os.path.realpath(root))
     selected: List[Path] = []
     for rel in sorted(item for item in raw.split("\0") if item):
-        path = (root / rel).resolve()
-        if not _ingest_is_within_repo(path, root):
+        path = root / rel
+        if Path(os.path.realpath(path)) != real_root / rel:
+            # A tracked symlink commits the link, not the target bytes, so the
+            # target content is not reproducible from the archive HEAD. Skip
+            # it here and in verify (both use this selection), consistently.
+            continue
+        if not _ingest_is_within_repo(path.resolve(), root):
             raise ValueError(f"tracked Markdown escapes external archive root: {rel}")
         if path.suffix == ".md" and path.is_file():
             selected.append(path)
@@ -3389,13 +3395,15 @@ def _read_external_archive_revision(
 
 
 def _ingest_source_key(path: Path, repo_root: Path, external_root: Optional[Path]) -> str:
-    resolved = path.resolve()
     if external_root is not None:
+        resolved = path.resolve()
         root = external_root.resolve()
         if not _ingest_is_within_repo(resolved, root):
             raise ValueError(f"external source escapes selected root: {resolved}")
         return str(resolved)
-    return resolved.relative_to(repo_root.resolve()).as_posix()
+    # Lexical identity, deliberately NOT resolve(): a symlink must never be
+    # renamed to its target. Selection has already rejected symlinked paths.
+    return path.relative_to(repo_root).as_posix()
 
 
 def _ingest_source_in_scope(
@@ -3567,28 +3575,60 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
 
 
 def _ingest_expand_paths_arg(raw_paths: Sequence[str], repo_root: Path) -> List[Path]:
-    """Resolve explicit --paths entries. Directories expand to **/*.md. Any
-    entry that resolves outside the repo is a hard die (guard #2)."""
-    resolved: List[Path] = []
+    """Expand explicit --paths entries into lexical repo paths. Directories
+    expand to their managed **/*.md content. Hard dies (guard #2): an entry
+    outside the repo, a missing entry, an entry that is or crosses a symlink
+    (Git commits the link, not the target bytes, so target content is not
+    reproducible from HEAD), and an explicit file outside the managed corpus
+    (--paths narrows the managed selection; it never widens it)."""
+    real_root = Path(os.path.realpath(repo_root))
+    expanded: List[Path] = []
     for raw in raw_paths:
         p = Path(raw)
         if not p.is_absolute():
             p = Path.cwd() / p
-        p = p.resolve()
-        if not _ingest_is_within_repo(p, repo_root):
+        lexical = Path(os.path.normpath(str(p)))
+        rel: Optional[Path] = None
+        for root in (repo_root, real_root):
+            try:
+                rel = lexical.relative_to(root)
+                break
+            except ValueError:
+                continue
+        if rel is None:
             die(
                 f"--paths entry '{raw}' resolves outside the repo ({repo_root}); "
                 "ingest-docs only ingests repo-local files",
                 where="ingest-docs",
                 code=2,
             )
-        if not p.exists():
-            die(f"--paths entry '{raw}' does not exist (resolved to {p})", where="ingest-docs", code=2)
-        if p.is_dir():
-            resolved.extend(sorted(p.rglob("*.md")))
+        anchored = repo_root / rel
+        if not anchored.exists():
+            die(f"--paths entry '{raw}' does not exist (resolved to {anchored})", where="ingest-docs", code=2)
+        if Path(os.path.realpath(anchored)) != real_root / rel:
+            die(
+                f"--paths entry '{raw}' is or crosses a symlink; the managed corpus "
+                "indexes regular committed files only",
+                where="ingest-docs",
+                code=2,
+            )
+        if anchored.is_dir():
+            expanded.extend(
+                child
+                for child in sorted(anchored.rglob("*.md"))
+                if _ingest_source_in_default_scope(child.relative_to(repo_root).as_posix())
+            )
         else:
-            resolved.append(p)
-    return resolved
+            if not _ingest_source_in_default_scope(rel.as_posix()):
+                die(
+                    f"--paths entry '{raw}' is outside the managed document corpus "
+                    "(docs/**/*.md, AGENTS.md, .agent/tasks/**/spec.md); the Git commit "
+                    "boundary and verify-doc-index cover only that corpus",
+                    where="ingest-docs",
+                    code=2,
+                )
+            expanded.append(anchored)
+    return expanded
 
 
 def _ingest_default_selection(repo_root: Path) -> List[Path]:
@@ -3605,22 +3645,35 @@ def _ingest_default_selection(repo_root: Path) -> List[Path]:
     return candidates
 
 
-def _ingest_apply_excludes_sort_dedupe(paths: Iterable[Path], repo_root: Path) -> List[Path]:
+def _ingest_apply_excludes_sort_dedupe(
+    paths: Iterable[Path], repo_root: Path
+) -> Tuple[List[Path], List[str]]:
     """Always exclude CLAUDE.md, anything under memgraph/, and any non-.md file.
-    Applies uniformly to default selection and to --paths expansion."""
+    Applies uniformly to default selection and to --paths expansion.
+
+    Source identity is the LEXICAL repo-relative path — never the resolved
+    target of a symlink: resolving would let a link inside the managed corpus
+    smuggle non-corpus bytes in under the target's name. A candidate whose
+    on-disk identity crosses a symlink anywhere inside the repo (the file
+    itself or a directory component) is excluded from the corpus and returned
+    in the second element for reporting, mirroring ignored_managed_paths."""
+    real_root = Path(os.path.realpath(repo_root))
     seen: Dict[str, Path] = {}
+    symlinked: Set[str] = set()
     for p in paths:
-        rp = p.resolve()
-        if rp.suffix != ".md" or rp.name == "CLAUDE.md":
-            continue
         try:
-            rel = rp.relative_to(repo_root)
+            rel = p.relative_to(repo_root)
         except ValueError:
+            continue
+        if rel.suffix != ".md" or rel.name == "CLAUDE.md":
             continue
         if "memgraph" in rel.parts:
             continue
-        seen[rel.as_posix()] = rp
-    return [seen[k] for k in sorted(seen)]
+        if Path(os.path.realpath(p)) != real_root / rel:
+            symlinked.add(rel.as_posix())
+            continue
+        seen[rel.as_posix()] = repo_root / rel
+    return [seen[k] for k in sorted(seen)], sorted(symlinked)
 
 
 def _ingest_is_chunk_referenced(conn: sqlite3.Connection, object_id: int) -> bool:
@@ -3864,6 +3917,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
         )
     try:
         external_revision: Optional[str] = None
+        symlinked_managed_paths: List[str] = []
         if external_root is not None:
             external_revision = _ingest_external_revision(external_root)
             selected = _ingest_external_tracked_markdown(external_root)
@@ -3872,7 +3926,11 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
                 raw_candidates = _ingest_expand_paths_arg(args.paths, repo_root)
             else:
                 raw_candidates = _ingest_default_selection(repo_root)
-            selected = _ingest_apply_excludes_sort_dedupe(raw_candidates, repo_root)
+            selected, symlinked_managed_paths = _ingest_apply_excludes_sort_dedupe(
+                raw_candidates, repo_root
+            )
+            for key in symlinked_managed_paths:
+                log(f"symlink, outside the reproducible corpus, not indexed: {key}")
     except ValueError as exc:
         die(str(exc), where="ingest-docs", code=2)
 
@@ -4180,6 +4238,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
         "ignored_managed_paths": (
             git_gate["ignored_managed_paths"] if git_gate is not None else []
         ),
+        "symlinked_managed_paths": symlinked_managed_paths,
         **counters,
         "dry_run": dry_run,
     }
@@ -4398,6 +4457,10 @@ def _verify_doc_index(
     removed-but-referenced sections) are audited by the same rule: valid ones
     land in retained_evidence_chunks, violations fail the check via
     invalid_evidence_tombstones.
+    In repo scope, EVERY relative source path in the DB is audited, not only
+    paths inside the managed corpus: a repo source outside that corpus was
+    never legitimately ingested and fails as unexpected regardless of its
+    chunk state — no tombstone leniency applies to it.
     dirty_managed_paths (uncommitted managed files, supplied by the caller)
     is its own failure category, kept separate from stale-source reporting.
     """
@@ -4452,10 +4515,14 @@ def _verify_doc_index(
             if row["source_category"] != "other"
         )
     elif repo_root is not None:
+        # Every relative path is a repo source and must be accounted for —
+        # scoping this to _ingest_source_in_default_scope would make sources
+        # smuggled in from outside the managed corpus (e.g. via a permissive
+        # --paths or a resolved symlink) invisible to verification.
         scoped_paths = {
             str(path)
             for (path,) in conn.execute("SELECT path FROM sources").fetchall()
-            if _ingest_source_in_default_scope(str(path))
+            if not Path(str(path)).is_absolute()
         }
         expected_roles = {
             path: _ingest_classify_source(path)
@@ -4484,6 +4551,12 @@ def _verify_doc_index(
             "SELECT id FROM sources WHERE path=?", (leftover_path,)
         ).fetchone()
         if row is None:
+            continue
+        if external_root is None and not _ingest_source_in_default_scope(leftover_path):
+            # A repo source outside the managed corpus was never legitimately
+            # ingested, so it gets no evidence-tombstone leniency: reject it
+            # outright, whatever the state of its chunks.
+            unexpected_sources.append(leftover_path)
             continue
         chunk_rows = conn.execute(
             """
@@ -4600,6 +4673,7 @@ def cmd_verify_doc_index(args: argparse.Namespace) -> None:
     git_gate: Optional[Dict[str, Any]] = None
     try:
         external_revision: Optional[str] = None
+        symlinked_managed_paths: List[str] = []
         if external_root is not None:
             external_revision = _ingest_external_revision(external_root)
             selected = _ingest_external_tracked_markdown(external_root)
@@ -4612,7 +4686,7 @@ def cmd_verify_doc_index(args: argparse.Namespace) -> None:
                     where="verify-doc-index",
                     code=2,
                 )
-            selected = _ingest_apply_excludes_sort_dedupe(
+            selected, symlinked_managed_paths = _ingest_apply_excludes_sort_dedupe(
                 _ingest_default_selection(repo_root), repo_root
             )
             ignored_keys = set(git_gate["ignored_managed_paths"])
@@ -4667,6 +4741,7 @@ def cmd_verify_doc_index(args: argparse.Namespace) -> None:
             "ignored_managed_paths": (
                 git_gate["ignored_managed_paths"] if git_gate is not None else []
             ),
+            "symlinked_managed_paths": symlinked_managed_paths,
         }
     )
     json.dump(result, sys.stdout, ensure_ascii=False)
@@ -4921,7 +4996,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--paths",
         nargs="+",
         default=None,
-        help="Explicit files and/or directories to ingest (directories expand to **/*.md); replaces the default selection",
+        help=(
+            "Explicit managed files and/or directories to ingest (directories "
+            "expand to their managed **/*.md); narrows the default selection, "
+            "never widens it — entries outside the managed corpus or crossing "
+            "a symlink are an error"
+        ),
     )
     idoc.add_argument(
         "--external-root",
