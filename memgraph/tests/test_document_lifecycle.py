@@ -57,6 +57,39 @@ def _git(root: Path, *args: str) -> None:
     )
 
 
+class TransactionErrorPreservationTests(unittest.TestCase):
+    def test_write_claim_preserves_begin_error_when_no_transaction_started(self) -> None:
+        class LockedConnection:
+            def __init__(self) -> None:
+                self.rollback_calls = 0
+
+            def execute(self, statement: str, *args: Any) -> None:
+                if statement == "BEGIN IMMEDIATE":
+                    raise sqlite3.OperationalError("database is locked")
+                if statement == "ROLLBACK":
+                    raise sqlite3.OperationalError(
+                        "cannot rollback - no transaction is active"
+                    )
+                raise AssertionError(f"unexpected SQL: {statement}")
+
+            def rollback(self) -> None:
+                self.rollback_calls += 1
+
+        conn = LockedConnection()
+        args = MEMGRAPH.argparse.Namespace(
+            statement="parallel writer observation",
+            type="fact",
+            entity=None,
+            dry_run=False,
+        )
+
+        with mock.patch.object(MEMGRAPH, "connect", return_value=conn):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                MEMGRAPH.cmd_write_claim(args)
+
+        self.assertEqual(conn.rollback_calls, 1)
+
+
 class ThematicClassificationTests(unittest.TestCase):
     def test_docs_knowledge_is_thematic_doc(self) -> None:
         self.assertEqual(
@@ -78,6 +111,36 @@ class ThematicClassificationTests(unittest.TestCase):
         self.assertEqual(
             MEMGRAPH._ingest_classify_source("AGENTS.md"),
             ("runtime_prompt", "policies"),
+        )
+
+    def test_full_corpus_classification_covers_every_tracked_family(self) -> None:
+        self.assertEqual(
+            MEMGRAPH._ingest_classify_source("CLAUDE.md"),
+            ("runtime_prompt_pointer", "policies"),
+        )
+        self.assertEqual(
+            MEMGRAPH._ingest_classify_source("README.md"),
+            ("readme", "project_doc"),
+        )
+        self.assertEqual(
+            MEMGRAPH._ingest_classify_source("memgraph/README.md"),
+            ("tool_doc", "other"),
+        )
+        self.assertEqual(
+            MEMGRAPH._ingest_classify_source("memgraph/queries/insert_claim.md"),
+            ("tool_doc", "other"),
+        )
+        self.assertEqual(
+            MEMGRAPH._ingest_classify_source("research/rankrent/raw-results.md"),
+            ("research_raw", "other"),
+        )
+        self.assertEqual(
+            MEMGRAPH._ingest_classify_source("shared/checklists/launch.md"),
+            ("doc", "other"),
+        )
+        self.assertEqual(
+            MEMGRAPH._ingest_classify_source(".agent/tasks/WF-3/spec.md"),
+            ("task_spec", "task_packet"),
         )
 
     def test_thematic_doc_keeps_full_recall_authority(self) -> None:
@@ -289,9 +352,9 @@ class VerifierContractTests(unittest.TestCase):
         self.assertEqual(result["unexpected_sources"], ["docs/knowledge/mixed.md"])
         self.assertEqual(result["retained_evidence_sources"], [])
 
-    def test_out_of_scope_repo_source_is_rejected(self) -> None:
-        # A repo-relative source outside the managed corpus (smuggled in by an
-        # old permissive --paths or a resolved symlink) must fail verification,
+    def test_active_leftover_repo_source_is_rejected(self) -> None:
+        # A repo-relative source with active chunks that is not in the expected
+        # corpus (e.g. its file is untracked or gone) must fail verification,
         # not fall outside the audited scope.
         conn = self._connection()
         self._add_active_source(conn, 1, "docs/knowledge/topic.md", 42)
@@ -307,17 +370,30 @@ class VerifierContractTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["unexpected_sources"], ["private/uncommitted.md"])
 
-    def test_out_of_scope_tombstone_gets_no_leniency(self) -> None:
-        # Evidence-tombstone retention exists for previously managed documents.
-        # A tombstone-shaped source outside the managed corpus is still an
-        # unexpected source, never a retained one.
+    def test_markdown_tombstone_anywhere_gets_leniency(self) -> None:
+        # The corpus covers every tracked Markdown file, so a tombstone-shaped
+        # relative *.md source may be a legitimately deleted former document;
+        # evidence retention applies wherever the file used to live.
         conn = self._connection()
         self._add_tombstone_source(conn, 1, "private/old.md", 42)
 
         result = MEMGRAPH._verify_doc_index(conn, [], repo_root=self.REPO_ROOT)
 
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["retained_evidence_sources"], ["private/old.md"])
+        self.assertEqual(result["unexpected_sources"], [])
+        self.assertEqual(result["invalid_evidence_tombstones"], [])
+
+    def test_non_markdown_leftover_gets_no_leniency(self) -> None:
+        # A source that could never belong to the Markdown corpus is rejected
+        # outright, tombstone-shaped or not.
+        conn = self._connection()
+        self._add_tombstone_source(conn, 1, "private/old.txt", 42)
+
+        result = MEMGRAPH._verify_doc_index(conn, [], repo_root=self.REPO_ROOT)
+
         self.assertFalse(result["ok"])
-        self.assertEqual(result["unexpected_sources"], ["private/old.md"])
+        self.assertEqual(result["unexpected_sources"], ["private/old.txt"])
         self.assertEqual(result["retained_evidence_sources"], [])
         self.assertEqual(result["invalid_evidence_tombstones"], [])
 
@@ -524,6 +600,73 @@ class EndToEndLifecycleTests(unittest.TestCase):
         self.assertTrue(ingest["committable"])
         self.assertTrue(verify["ok"])
         self.assertTrue(verify["corpus_empty"])
+
+    def _tracked_markdown(self) -> list:
+        raw = subprocess.check_output(
+            ["git", "-C", str(self.repo), "ls-files", "-z", "--", "*.md"],
+        ).decode("utf-8")
+        return sorted(item for item in raw.split("\0") if item)
+
+    def test_full_corpus_indexes_every_tracked_markdown(self) -> None:
+        _git(self.repo, "init", "-q")
+        self._write("AGENTS.md", "# Agents\n\nRules body.\n")
+        self._write("CLAUDE.md", "@AGENTS.md\n")
+        self._write("README.md", "# Map\n\nRepo map for humans.\n")
+        self._write("docs/spec.md", "# Spec\n\nStrategy.\n")
+        self._write("memgraph/SKILL.md", "# Skill\n\nEngine doc.\n")
+        self._write("memgraph/queries/insert_claim.md", "# Insert claim\n\nSQL template.\n")
+        self._write("research/rankrent/raw-dump.md", "# Dump\n\nRaw rows.\n")
+        self._write("shared/checklist.md", "# Checklist\n\nSteps.\n")
+        self._write(".agent/tasks/WF-1/spec.md", "# Task\n\nFrozen packet.\n")
+        self._write("tools/build.txt", "not markdown\n")
+        self._write(".gitignore", "scratch/\n")
+        self._commit_all()
+        self._write("scratch/tmp.md", "# Scratch\n\nIgnored draft.\n")
+
+        ingest = self._run_cli("ingest-docs")
+        verify = self._run_cli("verify-doc-index")
+
+        tracked = self._tracked_markdown()
+        self.assertEqual(len(tracked), 9)
+        self.assertTrue(ingest["ok"])
+        self.assertEqual(ingest["files_new"], 9)
+        sources = self._sources()
+        self.assertEqual(sorted(sources), tracked)
+        self.assertEqual(sources["CLAUDE.md"], ("runtime_prompt_pointer", "policies"))
+        self.assertEqual(sources["README.md"], ("readme", "project_doc"))
+        self.assertEqual(sources["memgraph/SKILL.md"], ("tool_doc", "other"))
+        self.assertEqual(
+            sources["research/rankrent/raw-dump.md"], ("research_raw", "other")
+        )
+        self.assertEqual(sources["shared/checklist.md"], ("doc", "other"))
+        self.assertEqual(
+            sources[".agent/tasks/WF-1/spec.md"], ("task_spec", "task_packet")
+        )
+        self.assertTrue(verify["ok"])
+
+        self.embed.reset_mock()
+        rerun = self._run_cli("ingest-docs")
+        self.assertTrue(rerun["ok"])
+        self.assertEqual(rerun["files_unchanged"], 9)
+        self.assertEqual(rerun["files_new"], 0)
+        self.assertEqual(rerun["chunks_added"], 0)
+        self.assertEqual(self.embed.call_count, 0)
+        self.assertTrue(self._run_cli("verify-doc-index")["ok"])
+
+    def test_untracked_root_markdown_blocks_ingest(self) -> None:
+        _git(self.repo, "init", "-q")
+        self._write("README.md", "# Map\n\nBody.\n")
+        self._commit_all()
+        self._write("NOTES.md", "# Notes\n\nDraft.\n")
+
+        payload, code = self._run_cli_expect_exit("ingest-docs")
+        dry = self._run_cli("ingest-docs", "--dry-run")
+
+        self.assertEqual(code, 2)
+        self.assertIn("NOTES.md", payload["error"])
+        self.assertTrue(dry["ok"])
+        self.assertFalse(dry["committable"])
+        self.assertEqual(dry["dirty_managed_paths"], ["NOTES.md"])
 
     def test_ingest_classifies_knowledge_channel_and_verifies(self) -> None:
         _git(self.repo, "init", "-q")
@@ -802,9 +945,10 @@ class EndToEndLifecycleTests(unittest.TestCase):
 
     def test_ignored_symlink_to_untracked_target_is_not_indexed(self) -> None:
         # An ignored symlink must not smuggle its (uncommitted) target into the
-        # corpus under the target's resolved name.
+        # corpus under the target's resolved name. Under tracked-file selection
+        # it is never a candidate; the ignore inventory still reports it.
         _git(self.repo, "init", "-q")
-        self._write(".gitignore", "docs/knowledge/\n")
+        self._write(".gitignore", "docs/knowledge/\nprivate/\n")
         self._write("docs/spec.md", "# Spec\n\nBody.\n")
         self._commit_all()
         self._write("private/uncommitted.md", "# Leak\n\nSecret.\n")
@@ -816,14 +960,16 @@ class EndToEndLifecycleTests(unittest.TestCase):
         self.assertTrue(ingest["ok"])
         self.assertTrue(ingest["committable"])
         self.assertEqual(
-            ingest["symlinked_managed_paths"], ["docs/knowledge/leak.md"]
+            ingest["ignored_managed_paths"],
+            ["docs/knowledge/leak.md", "private/uncommitted.md"],
         )
         self.assertNotIn("private/uncommitted.md", self._sources())
         self.assertNotIn("docs/knowledge/leak.md", self._sources())
         self.assertIn("docs/spec.md", self._sources())
         self.assertTrue(verify["ok"])
         self.assertEqual(
-            verify["symlinked_managed_paths"], ["docs/knowledge/leak.md"]
+            verify["ignored_managed_paths"],
+            ["docs/knowledge/leak.md", "private/uncommitted.md"],
         )
 
     def test_tracked_symlink_to_untracked_target_is_not_indexed(self) -> None:
@@ -831,10 +977,11 @@ class EndToEndLifecycleTests(unittest.TestCase):
         # symlink still must not put its untracked target's content into the
         # committed memory.db.
         _git(self.repo, "init", "-q")
+        self._write(".gitignore", "private/\n")
         self._write("docs/spec.md", "# Spec\n\nBody.\n")
         self._write("private/uncommitted.md", "# Leak\n\nSecret.\n")
         self._symlink("docs/link.md", "../private/uncommitted.md")
-        _git(self.repo, "add", "docs")
+        _git(self.repo, "add", "docs", ".gitignore")
         _git(self.repo, "commit", "-qm", "tracked symlink")
 
         ingest = self._run_cli("ingest-docs")
@@ -855,6 +1002,7 @@ class EndToEndLifecycleTests(unittest.TestCase):
         # directory itself must be listed: file selection never descends into
         # it, so no per-file candidate would otherwise report the exclusion.
         _git(self.repo, "init", "-q")
+        self._write(".gitignore", "private/\n")
         self._write("docs/spec.md", "# Spec\n\nBody.\n")
         self._commit_all()
         self._write("private/x.md", "# Leak\n\nSecret.\n")
@@ -879,6 +1027,7 @@ class EndToEndLifecycleTests(unittest.TestCase):
         # and a pre-prune verify fails it — resolving against the current disk
         # would let the stale chunk keep serving deleted text via recall.
         _git(self.repo, "init", "-q")
+        self._write(".gitignore", "private/\n")
         self._write("docs/topic.md", "# Topic\n\nOld searchable token ALPHA-STALE.\n")
         self._commit_all()
         self._run_cli("ingest-docs")
@@ -959,22 +1108,33 @@ class EndToEndLifecycleTests(unittest.TestCase):
         self.assertNotIn(leak_key, self._sources())
         self.assertTrue(verify["ok"])
 
-    def test_paths_outside_managed_corpus_dies(self) -> None:
-        # --paths narrows the managed selection; it must never widen the
-        # corpus past the Git gate's and the verifier's managed scope.
+    def test_paths_accepts_tracked_markdown_and_rejects_untracked(self) -> None:
+        # --paths narrows the tracked-Markdown corpus; it accepts every tracked
+        # *.md (README.md included) and rejects an untracked entry, which is
+        # outside the Git commit boundary.
         _git(self.repo, "init", "-q")
+        self._write(".gitignore", "private/\n")
         self._write("docs/spec.md", "# Spec\n\nBody.\n")
-        self._write("README.md", "# Readme\n\nCommitted but unmanaged.\n")
+        self._write("README.md", "# Readme\n\nCommitted and managed.\n")
         self._commit_all()
         self._write("private/uncommitted.md", "# Leak\n\nSecret.\n")
 
-        for entry in ("private/uncommitted.md", "README.md"):
-            payload, code = self._run_cli_expect_exit(
-                "ingest-docs", "--paths", str(self.repo / entry), "--no-prune"
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("outside the managed document corpus", payload["error"])
+        payload, code = self._run_cli_expect_exit(
+            "ingest-docs",
+            "--paths",
+            str(self.repo / "private/uncommitted.md"),
+            "--no-prune",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("not a git-tracked Markdown file", payload["error"])
         self.assertEqual(self._sources(), {})
+
+        ingest = self._run_cli(
+            "ingest-docs", "--paths", str(self.repo / "README.md"), "--no-prune"
+        )
+        self.assertTrue(ingest["ok"])
+        self.assertEqual(sorted(self._sources()), ["README.md"])
+        self.assertEqual(self._sources()["README.md"], ("readme", "project_doc"))
 
     def test_paths_symlink_entry_dies(self) -> None:
         _git(self.repo, "init", "-q")

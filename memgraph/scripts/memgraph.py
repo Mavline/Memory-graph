@@ -611,7 +611,7 @@ def apply_generated_view_refresh_plan(
         materialize(
             conn,
             object_id,
-            "generated_view",
+            "view",  # objects.object_type CHECK only allows 'view', not 'generated_view'
             title=title,
             summary=str(item["summary"]),
             body=new_body,
@@ -676,7 +676,7 @@ def refresh_generated_views(
         write_conn.execute("COMMIT")
     except BaseException:
         try:
-            write_conn.execute("ROLLBACK")
+            write_conn.rollback()
         except sqlite3.Error:
             pass
         raise
@@ -1923,7 +1923,7 @@ def cmd_write_decision(args: argparse.Namespace) -> None:
             add_relation(conn, obj_id, args.relation or "relates_to", int(rel_target))
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "type": "decision"}, sys.stdout)
     sys.stdout.write("\n")
@@ -2020,7 +2020,7 @@ def cmd_write_claim(args: argparse.Namespace) -> None:
             add_relation(conn, obj_id, args.relation or "about", int(rel_target))
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "type": "claim"}, sys.stdout)
     sys.stdout.write("\n")
@@ -2105,7 +2105,7 @@ def cmd_write_entity(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "type": "entity"}, sys.stdout)
     sys.stdout.write("\n")
@@ -2160,7 +2160,7 @@ def cmd_alias_entity(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "changed": True}, sys.stdout)
     sys.stdout.write("\n")
@@ -2312,7 +2312,7 @@ def cmd_open_wf(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "wf_id": wf_id, "sequence_no": next_seq}, sys.stdout)
     sys.stdout.write("\n")
@@ -2406,7 +2406,7 @@ def cmd_wf_status(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
 
     json.dump(
@@ -2517,7 +2517,7 @@ def cmd_open_run(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "run_id": run_id, "sequence_no": next_seq}, sys.stdout)
     sys.stdout.write("\n")
@@ -2578,7 +2578,7 @@ def cmd_close_run(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "run_id": args.run, "new_status": args.status}, sys.stdout)
     sys.stdout.write("\n")
@@ -2683,7 +2683,7 @@ def cmd_open_tranche(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
 
     json.dump(
@@ -2756,7 +2756,7 @@ def cmd_update_tranche(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
 
     json.dump({
@@ -2886,7 +2886,7 @@ def cmd_close_tranche(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
 
     json.dump(
@@ -3012,7 +3012,7 @@ def cmd_write_review(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "wf": args.wf, "verdict": args.verdict}, sys.stdout)
     sys.stdout.write("\n")
@@ -3077,7 +3077,7 @@ def cmd_write_policy(args: argparse.Namespace) -> None:
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
     json.dump({"ok": True, "object_id": obj_id, "policy_name": name}, sys.stdout)
     sys.stdout.write("\n")
@@ -3236,6 +3236,10 @@ def _ingest_classify_source(rel_posix: str, *, external: bool = False) -> Tuple[
         return "external_memory_archive", "other"
     if rel_posix == "AGENTS.md":
         return "runtime_prompt", "policies"
+    if rel_posix == "CLAUDE.md":
+        return "runtime_prompt_pointer", "policies"
+    if rel_posix == "README.md":
+        return "readme", "project_doc"
     if rel_posix.startswith("docs/evidence/"):
         return "evidence", "project_doc"
     if rel_posix.startswith("docs/knowledge/"):
@@ -3244,6 +3248,10 @@ def _ingest_classify_source(rel_posix: str, *, external: bool = False) -> Tuple[
         return "strategic_doc", "project_doc"
     if rel_posix.startswith(".agent/tasks/") and rel_posix.endswith("/spec.md"):
         return "task_spec", "task_packet"
+    if rel_posix.split("/", 1)[0] == "memgraph":
+        return "tool_doc", "other"
+    if rel_posix.split("/", 1)[0] == "research":
+        return "research_raw", "other"
     return "doc", "other"
 
 
@@ -3371,7 +3379,7 @@ def _record_external_archive_revision(
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        conn.rollback()
         raise
 
 
@@ -3435,32 +3443,29 @@ def _ingest_source_in_scope(
     return not normalized.is_absolute() and normalized.parts[:1] != ("..",)
 
 
-def _ingest_source_in_default_scope(source_path: str) -> bool:
-    """Return whether a stored relative source belongs to default managed docs."""
+def _ingest_source_in_corpus_shape(source_path: str) -> bool:
+    """Return whether a stored relative source has the corpus shape.
+
+    The corpus is every git-tracked Markdown file of the target repo, so the
+    only LEXICAL invariants a stored key must satisfy are: relative, `.md`,
+    not escaping the repo. Tracked-ness is a property of the live Git index
+    and is checked by the callers that own a Git view."""
     candidate = Path(source_path)
     if candidate.is_absolute() or candidate.suffix != ".md":
         return False
-    parts = candidate.parts
-    if not parts or candidate.name == "CLAUDE.md" or "memgraph" in parts:
+    if not candidate.parts:
         return False
-    if source_path == "AGENTS.md":
-        return True
-    if parts[0] == "docs":
-        return True
-    return (
-        len(parts) >= 4
-        and parts[0] == ".agent"
-        and parts[1] == "tasks"
-        and candidate.name == "spec.md"
-    )
+    normalized = Path(os.path.normpath(source_path))
+    return not normalized.is_absolute() and normalized.parts[:1] != ("..",)
 
 
-# Pathspecs limiting the git-state scan to the managed document corpus. The
-# actual membership test is _ingest_source_in_default_scope; these only bound
-# how much of the tree `git status` has to walk. `.agent/memory.db` is outside
-# every pathspec by construction, so the ingest-then-commit-the-DB cadence
-# never trips the gate.
-_MANAGED_GIT_PATHSPECS = ("docs", "AGENTS.md", ".agent/tasks")
+# Pathspec limiting the git-state scan to the document corpus: every Markdown
+# file in the tree (`**/` matches zero or more leading directories, so root
+# files like AGENTS.md are covered). The actual membership test is
+# _ingest_source_in_corpus_shape plus tracked-ness; this only bounds how much
+# of the tree `git status` has to walk. `.agent/memory.db` is not Markdown,
+# so the ingest-then-commit-the-DB cadence never trips the gate.
+_MANAGED_GIT_PATHSPECS = (":(glob)**/*.md",)
 
 
 def _ingest_git_toplevel(repo_root: Path) -> Optional[Path]:
@@ -3558,7 +3563,7 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
     ignored: Set[str] = {
         candidate
         for candidate in raw_ignored.split("\0")
-        if candidate and _ingest_source_in_default_scope(candidate)
+        if candidate and _ingest_source_in_corpus_shape(candidate)
     }
     dirty: Set[str] = set()
     fields = raw_status.split("\0")
@@ -3576,7 +3581,7 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
         if status_xy == "!!":
             continue
         for candidate in paths:
-            if not _ingest_source_in_default_scope(candidate):
+            if not _ingest_source_in_corpus_shape(candidate):
                 continue
             dirty.add(candidate)
     return {
@@ -3587,13 +3592,19 @@ def _ingest_managed_git_state(repo_root: Path) -> Dict[str, Any]:
     }
 
 
-def _ingest_expand_paths_arg(raw_paths: Sequence[str], repo_root: Path) -> List[Path]:
+def _ingest_expand_paths_arg(
+    raw_paths: Sequence[str],
+    repo_root: Path,
+    tracked_rels: Optional[Set[str]] = None,
+) -> List[Path]:
     """Expand explicit --paths entries into lexical repo paths. Directories
-    expand to their managed **/*.md content. Hard dies (guard #2): an entry
+    expand to their tracked **/*.md content. Hard dies (guard #2): an entry
     outside the repo, a missing entry, an entry that is or crosses a symlink
     (Git commits the link, not the target bytes, so target content is not
-    reproducible from HEAD), and an explicit file outside the managed corpus
-    (--paths narrows the managed selection; it never widens it)."""
+    reproducible from HEAD), and an explicit file outside the tracked-Markdown
+    corpus (--paths narrows the selection; it never widens it). When no Git
+    view is available (tracked_rels is None, --dry-run preview only) the
+    tracked-ness check is skipped."""
     real_root = Path(os.path.realpath(repo_root))
     expanded: List[Path] = []
     for raw in raw_paths:
@@ -3626,17 +3637,27 @@ def _ingest_expand_paths_arg(raw_paths: Sequence[str], repo_root: Path) -> List[
                 code=2,
             )
         if anchored.is_dir():
-            expanded.extend(
-                child
-                for child in sorted(anchored.rglob("*.md"))
-                if _ingest_source_in_default_scope(child.relative_to(repo_root).as_posix())
-            )
+            for child in sorted(anchored.rglob("*.md")):
+                child_rel = child.relative_to(repo_root).as_posix()
+                if not _ingest_source_in_corpus_shape(child_rel):
+                    continue
+                if tracked_rels is not None and child_rel not in tracked_rels:
+                    continue
+                expanded.append(child)
         else:
-            if not _ingest_source_in_default_scope(rel.as_posix()):
+            rel_posix = rel.as_posix()
+            if not _ingest_source_in_corpus_shape(rel_posix):
                 die(
-                    f"--paths entry '{raw}' is outside the managed document corpus "
-                    "(docs/**/*.md, AGENTS.md, .agent/tasks/**/spec.md); the Git commit "
-                    "boundary and verify-doc-index cover only that corpus",
+                    f"--paths entry '{raw}' is not a repo-relative Markdown file; "
+                    "the corpus covers every git-tracked *.md of the target repo",
+                    where="ingest-docs",
+                    code=2,
+                )
+            if tracked_rels is not None and rel_posix not in tracked_rels:
+                die(
+                    f"--paths entry '{raw}' is not a git-tracked Markdown file; "
+                    "the corpus covers exactly the tracked *.md set — commit the "
+                    "file first",
                     where="ingest-docs",
                     code=2,
                 )
@@ -3644,53 +3665,74 @@ def _ingest_expand_paths_arg(raw_paths: Sequence[str], repo_root: Path) -> List[
     return expanded
 
 
-def _ingest_default_selection(repo_root: Path) -> List[Path]:
+def _ingest_tracked_markdown(repo_root: Path) -> List[Path]:
+    """Exactly the git-tracked Markdown files of the target repo.
+
+    Mirrors _ingest_external_tracked_markdown: `git ls-files` is the corpus
+    authority, so selection and the `git ls-files '*.md'` acceptance check
+    cannot drift. Tracked-but-deleted files are dropped here — the dirty
+    corpus gate reports them. Symlinks stay in the candidate list so the
+    shared exclusion pass reports them instead of silently skipping."""
+    try:
+        raw = subprocess.check_output(
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--", "*.md"],
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8", errors="replace")
+    except (subprocess.CalledProcessError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"cannot enumerate tracked Markdown in {repo_root}: {exc}"
+        ) from exc
+    selected: List[Path] = []
+    for rel in sorted(item for item in raw.split("\0") if item):
+        if not _ingest_source_in_corpus_shape(rel):
+            continue
+        path = repo_root / rel
+        if os.path.lexists(path):
+            selected.append(path)
+    return selected
+
+
+def _ingest_walk_markdown(repo_root: Path) -> List[Path]:
+    """Filesystem fallback for the no-Git --dry-run preview: every *.md under
+    the repo except `.git`; symlinked directories are not descended into."""
     candidates: List[Path] = []
-    docs_dir = repo_root / "docs"
-    if docs_dir.is_dir():
-        candidates.extend(docs_dir.rglob("*.md"))
-    agents_md = repo_root / "AGENTS.md"
-    if agents_md.is_file():
-        candidates.append(agents_md)
-    tasks_dir = repo_root / ".agent" / "tasks"
-    if tasks_dir.is_dir():
-        candidates.extend(tasks_dir.rglob("spec.md"))
+    for dirpath, dirnames, filenames in os.walk(repo_root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            if name.endswith(".md"):
+                candidates.append(Path(dirpath) / name)
     return candidates
 
 
 def _ingest_symlinked_managed_dirs(repo_root: Path) -> List[str]:
-    """Symlinked directories inside the managed roots. File selection never
-    descends into them (and must not), so they produce no per-file candidates;
-    report the directory itself to keep symlinked_managed_paths an honest
-    inventory of every managed path excluded by the symlink rule."""
+    """Symlinked directories inside the repo tree. File selection never
+    descends into them (and Git does not track through them), so they produce
+    no per-file candidates; report the directory itself to keep
+    symlinked_managed_paths an honest inventory of every path excluded by the
+    symlink rule."""
     found: Set[str] = set()
-    for base in ("docs", ".agent/tasks"):
-        base_dir = repo_root / base
-        if base_dir.is_symlink():
-            found.add(base)
-            continue
-        if not base_dir.is_dir():
-            continue
-        for dirpath, dirnames, _filenames in os.walk(base_dir, followlinks=False):
-            for name in dirnames:
-                child = Path(dirpath) / name
-                if child.is_symlink():
-                    found.add(child.relative_to(repo_root).as_posix())
+    for dirpath, dirnames, _filenames in os.walk(repo_root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in dirnames:
+            child = Path(dirpath) / name
+            if child.is_symlink():
+                found.add(child.relative_to(repo_root).as_posix())
     return sorted(found)
 
 
 def _ingest_apply_excludes_sort_dedupe(
     paths: Iterable[Path], repo_root: Path
 ) -> Tuple[List[Path], List[str]]:
-    """Always exclude CLAUDE.md, anything under memgraph/, and any non-.md file.
-    Applies uniformly to default selection and to --paths expansion.
+    """Exclude any non-.md candidate and any candidate whose on-disk identity
+    crosses a symlink; sort and dedupe the rest. Applies uniformly to default
+    selection and to --paths expansion.
 
     Source identity is the LEXICAL repo-relative path — never the resolved
-    target of a symlink: resolving would let a link inside the managed corpus
-    smuggle non-corpus bytes in under the target's name. A candidate whose
-    on-disk identity crosses a symlink anywhere inside the repo (the file
-    itself or a directory component) is excluded from the corpus and returned
-    in the second element for reporting, mirroring ignored_managed_paths."""
+    target of a symlink: resolving would let a link inside the corpus smuggle
+    non-corpus bytes in under the target's name. A candidate whose on-disk
+    identity crosses a symlink anywhere inside the repo (the file itself or a
+    directory component) is excluded from the corpus and returned in the
+    second element for reporting, mirroring ignored_managed_paths."""
     real_root = Path(os.path.realpath(repo_root))
     seen: Dict[str, Path] = {}
     symlinked: Set[str] = set()
@@ -3699,9 +3741,7 @@ def _ingest_apply_excludes_sort_dedupe(
             rel = p.relative_to(repo_root)
         except ValueError:
             continue
-        if rel.suffix != ".md" or rel.name == "CLAUDE.md":
-            continue
-        if "memgraph" in rel.parts:
+        if rel.suffix != ".md":
             continue
         if Path(os.path.realpath(p)) != real_root / rel:
             symlinked.add(rel.as_posix())
@@ -3917,7 +3957,7 @@ def _ingest_run_prune(
             conn.execute("COMMIT")
     except Exception:
         if not dry_run:
-            conn.execute("ROLLBACK")
+            conn.rollback()
         raise
 
     return {
@@ -3949,6 +3989,8 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
             where="ingest-docs",
             code=2,
         )
+    git_gate: Optional[Dict[str, Any]] = None
+    tracked_rels: Optional[Set[str]] = None
     try:
         external_revision: Optional[str] = None
         symlinked_managed_paths: List[str] = []
@@ -3956,10 +3998,23 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
             external_revision = _ingest_external_revision(external_root)
             selected = _ingest_external_tracked_markdown(external_root)
         else:
+            git_gate = _ingest_managed_git_state(repo_root)
+            if git_gate["git_available"]:
+                tracked_candidates = _ingest_tracked_markdown(repo_root)
+                tracked_rels = {
+                    path.relative_to(repo_root).as_posix()
+                    for path in tracked_candidates
+                }
             if args.paths:
-                raw_candidates = _ingest_expand_paths_arg(args.paths, repo_root)
+                raw_candidates = _ingest_expand_paths_arg(
+                    args.paths, repo_root, tracked_rels
+                )
+            elif tracked_rels is not None:
+                raw_candidates = tracked_candidates
             else:
-                raw_candidates = _ingest_default_selection(repo_root)
+                # No Git: the walk feeds only the --dry-run preview; the gate
+                # below dies for a production run.
+                raw_candidates = _ingest_walk_markdown(repo_root)
             selected, symlinked_files = _ingest_apply_excludes_sort_dedupe(
                 raw_candidates, repo_root
             )
@@ -3974,9 +4029,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
     dry_run = bool(args.dry_run)
     do_prune = not args.no_prune
 
-    git_gate: Optional[Dict[str, Any]] = None
-    if external_root is None:
-        git_gate = _ingest_managed_git_state(repo_root)
+    if git_gate is not None:
         if not git_gate["git_available"]:
             if not dry_run:
                 die(
@@ -4094,7 +4147,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
                         )
                     conn.execute("COMMIT")
                 except Exception:
-                    conn.execute("ROLLBACK")
+                    conn.rollback()
                     raise
                 log(
                     f"reclassified: {rel_posix} "
@@ -4147,7 +4200,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
                     )
                 conn.execute("COMMIT")
             except Exception:
-                conn.execute("ROLLBACK")
+                conn.rollback()
                 raise
             counters["files_new"] += 1
             counters["chunks_added"] += len(drafts)
@@ -4228,7 +4281,7 @@ def cmd_ingest_docs(args: argparse.Namespace) -> None:
                 )
                 conn.execute("COMMIT")
             except Exception:
-                conn.execute("ROLLBACK")
+                conn.rollback()
                 raise
             counters["files_changed"] += 1
             counters["chunks_reused"] += len(reused)
@@ -4562,7 +4615,7 @@ def _verify_doc_index(
         )
     elif repo_root is not None:
         # Every relative path is a repo source and must be accounted for —
-        # scoping this to _ingest_source_in_default_scope would make sources
+        # scoping this to _ingest_source_in_corpus_shape would make sources
         # smuggled in from outside the managed corpus (e.g. via a permissive
         # --paths or a resolved symlink) invisible to verification.
         scoped_paths = {
@@ -4573,7 +4626,7 @@ def _verify_doc_index(
         expected_roles = {
             path: _ingest_classify_source(path)
             for path in expected
-            if _ingest_source_in_default_scope(path)
+            if _ingest_source_in_corpus_shape(path)
         }
         source_role_mismatches = sorted(
             path
@@ -4598,7 +4651,7 @@ def _verify_doc_index(
         ).fetchone()
         if row is None:
             continue
-        if external_root is None and not _ingest_source_in_default_scope(leftover_path):
+        if external_root is None and not _ingest_source_in_corpus_shape(leftover_path):
             # A repo source outside the managed corpus was never legitimately
             # ingested, so it gets no evidence-tombstone leniency: reject it
             # outright, whatever the state of its chunks.
@@ -4733,7 +4786,7 @@ def cmd_verify_doc_index(args: argparse.Namespace) -> None:
                     code=2,
                 )
             selected, symlinked_files = _ingest_apply_excludes_sort_dedupe(
-                _ingest_default_selection(repo_root), repo_root
+                _ingest_tracked_markdown(repo_root), repo_root
             )
             symlinked_managed_paths = sorted(
                 set(symlinked_files) | set(_ingest_symlinked_managed_dirs(repo_root))
@@ -5046,10 +5099,10 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help=(
-            "Explicit managed files and/or directories to ingest (directories "
-            "expand to their managed **/*.md); narrows the default selection, "
-            "never widens it — entries outside the managed corpus or crossing "
-            "a symlink are an error"
+            "Explicit tracked files and/or directories to ingest (directories "
+            "expand to their tracked **/*.md); narrows the default selection, "
+            "never widens it — untracked entries or entries crossing a symlink "
+            "are an error"
         ),
     )
     idoc.add_argument(
