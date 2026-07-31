@@ -195,22 +195,15 @@ All write helpers accept `--dry-run` which prints the computed `embedding_text`,
 materializes each chunk into `index_docs` + `memory_fts` + `memory_vec`, making
 document CONTENT retrievable by hybrid recall alongside typed records.
 
-- Default scope: every git-tracked `*.md` file of the target repo — selection
-  comes from `git ls-files -- '*.md'`, so the indexed source list always
-  matches the tracked-Markdown inventory. There are no silent exclusions;
-  excluding a raw or service document requires an explicit owner decision
-  recorded in memory.
+- Default scope: `docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`;
+  `CLAUDE.md` and `memgraph/**` are always excluded.
 - Source classification: `AGENTS.md` gets `source_role='runtime_prompt'`,
-  `CLAUDE.md` gets `runtime_prompt_pointer`, root `README.md` gets `readme`,
   `docs/evidence/**` gets `evidence`, `docs/knowledge/**` gets `thematic_doc`
   (agent-curated topical knowledge; full `1.0` recall authority),
   the rest of `docs/**` gets `strategic_doc`, `.agent/tasks/**/spec.md` gets
-  `task_spec`, `memgraph/**` gets `tool_doc`, `research/**` gets
-  `research_raw`, anything else gets `doc`. `source_category` stays within the
-  schema's closed list (tool and research docs land in `other`). Classification
-  is derived state: ingest refreshes role/category even for unchanged files
-  without re-embedding (a category change rewrites only the chunks'
-  `index_docs.tags`; the FTS trigger syncs).
+  `task_spec`. Classification is derived state: ingest refreshes role/category
+  even for unchanged files without re-embedding (a category change rewrites
+  only the chunks' `index_docs.tags`; the FTS trigger syncs).
 - Commit boundary: production `ingest-docs`/`verify-doc-index` require Git and
   a clean managed corpus relative to HEAD — modified, deleted, renamed, and
   untracked non-ignored managed files all block the run. `--dry-run` previews
@@ -246,11 +239,11 @@ document CONTENT retrievable by hybrid recall alongside typed records.
   approved decision; promotion is explicit (verify, then
   `write-claim`/`write-decision`).
 - One memory per repo: every command dies when `MEMGRAPH_DB` points outside
-  `<repo>/.agent/memory.db`. Normal `--paths` narrows the tracked selection
-  and never widens it: an explicit untracked file (or a file outside the
-  repo) is an error, and a directory expands only to its tracked `**/*.md`.
-  The Git commit boundary and the verifier cover exactly the tracked-Markdown
-  corpus, so nothing ingestable can bypass them.
+  `<repo>/.agent/memory.db`. Normal `--paths` narrows the managed selection
+  and never widens it: an explicit file outside the managed corpus (or outside
+  the repo) is an error, and a directory expands only to its managed
+  `**/*.md`. The Git commit boundary and the verifier cover exactly the
+  managed corpus, so nothing ingestable can bypass them.
 - Explicit owner-approved archive exception: `--external-root <git-root>`
   imports exactly that archive's git-tracked `*.md` files into the target
   repository's same DB. Source keys are absolute paths, `source_role` is

@@ -113,14 +113,10 @@ command at this wrapper:
 - Windows where Claude runs hooks under Git Bash can call the built-in shell:
   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File memgraph/memgraph.ps1 session-context`
 
-For Codex, the repo-level integration is `<repo>/.codex/hooks.json` with a
-`SessionStart` hook (matcher `startup|resume|clear|compact`) running the same
-wrapper command — the project hook layer is confirmed for codex-cli 0.146.0.
-A new or edited repo hook needs a one-time interactive approval in Codex's
-startup-hooks review before it runs; until then keep the shared rule in
-project-local `AGENTS.md` under Startup Discipline and run the wrapper command
-manually at session start. Keep `CLAUDE.md` as `@AGENTS.md` so Claude reads the
-same runtime rule.
+For Codex, put the shared rule in project-local `AGENTS.md` under Startup
+Discipline and run the same wrapper command at session start (or through any
+available local hook). Keep `CLAUDE.md` as `@AGENTS.md` so Claude reads the same
+runtime rule.
 
 `session-context` is pure SQL, so startup works offline and before the key is set.
 
@@ -137,10 +133,10 @@ NOT write smoke/test records (such as a "kit live" claim) to prove the kit
 works: typed memory is written only by real project events, and the empty
 state is valid.
 
-Document-index verification — as soon as the project has committed Markdown
-documents (the corpus is every git-tracked `*.md` file). Note that a freshly
-bootstrapped project that committed `AGENTS.md` already has a one-document
-corpus, so run this right after the bootstrap commit:
+Document-index verification — as soon as the project has committed managed
+documents (`docs/**/*.md`, `AGENTS.md`, `.agent/tasks/**/spec.md`). Note that
+a freshly bootstrapped project that committed `AGENTS.md` already has a
+one-document corpus, so run this right after the bootstrap commit:
 
     memgraph/memgraph ingest-docs
     memgraph/memgraph verify-doc-index
